@@ -1,0 +1,29 @@
+// ─────────────────────────────────────────────────────────────
+// ListPageLayout — เทมเพลตหน้ารายการ: หัวข้อ + ปุ่ม action + toolbar + เนื้อหา
+// ใช้กับ Products, Orders, Employees, Ingredients, Finance, Reports ฯลฯ
+// ─────────────────────────────────────────────────────────────
+export function ListPageLayout({
+  title,
+  actions,
+  toolbar,
+  children,
+}: {
+  title: string;
+  actions?: React.ReactNode;
+  toolbar?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="flex flex-col gap-5">
+      {/* จอแคบ: ปุ่ม action ขึ้นบรรทัดใหม่แทนการบีบหัวข้อ */}
+      <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-3">
+        <div>
+          <h1 className="text-xl font-semibold text-brown-900">{title}</h1>
+        </div>
+        {actions && <div className="flex items-center gap-2 shrink-0">{actions}</div>}
+      </div>
+      {toolbar && <div>{toolbar}</div>}
+      <div>{children}</div>
+    </div>
+  );
+}

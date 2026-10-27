@@ -1,0 +1,45 @@
+/**
+ * /api/admin/preorder-rounds/[id]/items
+ *   GET  — รายการสินค้าในรอบ (preorder.view) ?activeOnly= ?includeDeleted=
+ *   POST — เพิ่มสินค้าเข้ารอบ (preorder.update)
+ *          body: { product_id, price_override?, min_order_qty?, max_qty_total, is_active? }
+ *          product_id ต้องเป็นสินค้าพรีออเดอร์ (is_preorder: true)
+ */
+import { okList, created } from "@/lib/apiResponse";
+import { withPermission } from "@/lib/authGuard";
+import { auditChange } from "@/lib/audit";
+import { parseBody } from "@/lib/validate";
+import { parseBool } from "@/lib/queryParams";
+import { addRoundItemBody } from "@/schemas/preorderRound";
+import * as preorderRoundService from "@/services/preorderRoundService";
+
+type Ctx = { params: Promise<{ id: string }> };
+
+export const GET = withPermission("preorder", "view", async (_s, req, ctx: Ctx) => {
+  const { id } = await ctx.params;
+  const sp = req.nextUrl.searchParams;
+  const items = await preorderRoundService.listRoundItems(id, {
+    activeOnly: parseBool(sp.get("activeOnly")) ?? false,
+    includeDeleted: parseBool(sp.get("includeDeleted")) ?? false,
+  });
+  return okList(items);
+});
+
+export const POST = withPermission("preorder", "update", async (_s, req, ctx: Ctx) => {
+  const { id } = await ctx.params;
+  const body = await parseBody(req, addRoundItemBody);
+  const item = await preorderRoundService.addRoundItem(id, body);
+  const full: any = item?._id ? await preorderRoundService.getRoundItemById(String(item._id)).catch(() => undefined) : undefined;
+  auditChange(req, {
+    op: "create",
+    verb: "เพิ่ม",
+    noun: "สินค้า",
+    label: full?.product_id?.product_name_th,
+    suffix: full?.round_id?.round_name ? ` เข้ารอบ "${full.round_id.round_name}"` : " เข้ารอบพรีออเดอร์",
+    entity: "PreorderRoundItem",
+    entity_id: item?._id ? String(item._id) : null,
+    after: full ?? item,
+    keys: ["price_override", "min_order_qty", "max_qty_total", "is_active"],
+  });
+  return created(item);
+});

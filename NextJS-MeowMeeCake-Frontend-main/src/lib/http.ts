@@ -1,0 +1,204 @@
+// ─────────────────────────────────────────────────────────────
+// src/lib/http.ts
+// จุดเดียวที่คุยกับ network — axios instance + interceptor
+// ทุก service (src/services/*) เรียกผ่านตัวนี้ · ห้าม component/ViewModel เรียก axios ตรง
+// ดู docs/API_CONTRACT.md §6
+//
+// D15 (auth transport): ตอนนี้ใช้ cookie + withCredentials (ถ้าเปลี่ยนเป็น bearer token
+//   ให้เพิ่ม header ใน request interceptor ที่เดียว — ไม่ต้องแตะ service)
+// ─────────────────────────────────────────────────────────────
+import axios, { AxiosError, type AxiosRequestConfig } from "axios";
+import { readCookie } from "@/lib/cookies";
+import { LOCALE_COOKIE, defaultLocale } from "@/i18n/config";
+import type { ApiError, BackendErrorBody, ListResponse, RawListResponse } from "@/types/api";
+
+const isServer = typeof window === "undefined";
+
+/**
+ * ฝั่ง server (prefetch ข้อมูลสาธารณะของหน้าร้าน — src/app/customer/lib/prefetchPublic.ts) ยิง backend ตรง:
+ * API_PROXY_TARGET/api (ตอน deploy — NEXT_PUBLIC_API_BASE_URL เป็น "/api" แบบ relative ใช้บน server ไม่ได้)
+ * หรือ NEXT_PUBLIC_API_BASE_URL ถ้าเป็น URL เต็ม (dev บนเครื่อง)
+ */
+export function serverBaseURL(): string | undefined {
+  const target = (process.env.API_PROXY_TARGET ?? "").trim().replace(/\/+$/, "");
+  if (target) return `${target}/api`;
+  const pub = process.env.NEXT_PUBLIC_API_BASE_URL;
+  return pub && /^https?:\/\//.test(pub) ? pub : undefined;
+}
+
+const baseURL = isServer ? serverBaseURL() : process.env.NEXT_PUBLIC_API_BASE_URL;
+if (!baseURL && !isServer) {
+  console.warn("[http] NEXT_PUBLIC_API_BASE_URL is not set - requests will not resolve (set it in .env.local)");
+}
+
+const client = axios.create({
+  baseURL,
+  withCredentials: true, // ส่ง auth cookie ไปกับทุก request (D15)
+  timeout: 15_000,
+  // ฝั่ง server ใช้ fetch ของ Next (แคช 60 วิ) — มีแค่ข้อมูลสาธารณะ (/catalog/*) ที่ prefetch ตอน render หน้าร้าน
+  // เปิดหน้าซ้ำไม่ต้องรอ backend (Render) ทุกครั้ง · ฝั่ง browser ใช้ XHR ตามเดิม
+  ...(isServer ? { adapter: "fetch" as const, fetchOptions: { next: { revalidate: 60 } } } : {}),
+});
+
+// ── request: แนบภาษาปัจจุบัน ──
+client.interceptors.request.use((config) => {
+  config.headers.set("Accept-Language", readCookie(LOCALE_COOKIE) ?? defaultLocale);
+  return config;
+});
+
+// ── 401 handler ── authClient ลงทะเบียนที่นี่ (ล้าง cache + redirect ไป login)
+// backend ไม่มี refresh token (JWT อายุ 7 วัน) → 401 = session หมดอายุจริง ไม่มีการ refresh/retry
+// interceptor แค่แจ้ง handler แล้วยังโยน ApiError ของ backend กลับให้ผู้เรียกตามปกติ
+type UnauthorizedHandler = () => void;
+let onUnauthorized: UnauthorizedHandler | null = null;
+export function setUnauthorizedHandler(fn: UnauthorizedHandler | null): void {
+  onUnauthorized = fn;
+}
+
+/**
+ * error.details.issues[] (backend src/lib/validate.ts toIssues()) → { path: message }
+ * ที่ ViewModel/ฟอร์มใช้แปะใต้ input ได้ตรง ๆ — DUPLICATE_KEY ฯลฯ ที่ details ไม่ใช่ { issues } ก็คืน undefined
+ */
+function toFieldErrors(details: BackendErrorBody["error"]["details"]): Record<string, string> | undefined {
+  const issues = (details as { issues?: { path: string; message: string }[] } | null)?.issues;
+  if (!Array.isArray(issues) || issues.length === 0) return undefined;
+  return Object.fromEntries(issues.map((i) => [i.path, i.message]));
+}
+
+// ── response: แปลง error เป็น ApiError ที่ ViewModel ใช้ได้ ──
+// unwrap ตรงตาม envelope จริงของ backend: { success:false, error:{ code, message, details } }
+// (backend src/lib/apiResponse.ts toErrorResponse() / src/middleware.ts deny()) — ดู src/types/api.ts
+function toApiError(err: AxiosError<BackendErrorBody>): ApiError {
+  const status = err.response?.status ?? 0;
+  const body = err.response?.data;
+  const backendError = body?.success === false ? body.error : undefined;
+  const details = backendError?.details as { reason?: unknown; retry_after_seconds?: unknown } | null | undefined;
+  const reason = details?.reason;
+  const retryAfter = Number(details?.retry_after_seconds);
+  return {
+    status,
+    code: backendError?.code,
+    message: backendError?.message ?? (status === 0 ? "network error" : `request failed (${status})`),
+    fieldErrors: toFieldErrors(backendError?.details ?? null),
+    reason: typeof reason === "string" ? reason : undefined,
+    retryAfterSeconds: Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined,
+    cause: err,
+  };
+}
+
+/**
+ * endpoint ที่ 401 = "คำตอบของมันเอง" ไม่ใช่ "session หมดอายุ" → ห้ามเด้งไป login
+ *  - /auth/login: 401 คือรหัสผ่านผิด ต้องส่ง error ของ backend ("อีเมลหรือรหัสผ่านไม่ถูกต้อง") กลับให้ฟอร์มแสดงตรง ๆ
+ *    (ถ้าปล่อยเข้า handler จะเด้ง /login?reason=expired + ล้าง cache ทุกครั้งที่พิมพ์รหัสผิด)
+ *  - /auth/logout, /auth/register, /auth/google, /auth/resend-verification และหน้าบัญชีจากลิงก์ในอีเมล
+ *    (verify-email · forgot-password · reset-password): ไม่มี session ให้หมดอายุตั้งแต่แรก
+ * (/auth/me ไม่อยู่ในลิสต์นี้ — 401 ตรงนั้นคือ session หมดอายุจริง ให้เด้งไป login)
+ */
+const NO_EXPIRY_REDIRECT_PATHS = [
+  "/auth/login", "/auth/logout", "/auth/register", "/auth/google", "/auth/resend-verification",
+  "/auth/verify-email", "/auth/forgot-password", "/auth/reset-password",
+];
+
+// ส่ง { skipAuthRedirect: true } ใน config เพื่อบอกว่า 401 ของ request นี้ "ไม่ใช่ session หมดอายุ"
+// (เช่นหน้าร้านเช็คว่า guest ล็อกอินหรือยัง — authClient.meOptional) → ไม่เด้งไป login
+declare module "axios" {
+  interface AxiosRequestConfig {
+    skipAuthRedirect?: boolean;
+  }
+}
+
+function skipsUnauthorizedHandler(config: AxiosRequestConfig | undefined): boolean {
+  if (config?.skipAuthRedirect) return true;
+  const url = config?.url ?? "";
+  // config.url อาจเป็น relative ("/auth/login") หรือเต็ม (baseURL + path) — ตัด query แล้วเทียบท้าย path
+  const path = url.split("?")[0].replace(/\/+$/, "");
+  return NO_EXPIRY_REDIRECT_PATHS.some((p) => path === p || path.endsWith(p));
+}
+
+client.interceptors.response.use(
+  (res) => res,
+  (err: AxiosError) => {
+    if (err.response?.status === 401 && onUnauthorized && !skipsUnauthorizedHandler(err.config)) {
+      onUnauthorized();
+    }
+    return Promise.reject(toApiError(err as AxiosError<BackendErrorBody>));
+  },
+);
+
+/**
+ * backend ตัด ?limit= ไว้ไม่เกินเท่านี้ต่อคำขอ (src/lib/queryParams.ts parsePagination maxLimit) · ไม่ส่ง limit = 20
+ * ขอเกินนี้ → getList ไล่ขอทีละหน้าแล้วรวมให้ (ไม่งั้นได้แค่ 100 รายการแรกโดยไม่รู้ตัว)
+ */
+export const PAGE_MAX = 100;
+
+/** "โหลดทั้งหมด" สำหรับ dropdown / ตารางที่กรองฝั่ง client — ใช้แทนเลขลอย ๆ (200/500) · เพดานกันโหลดไม่จบ */
+export const LIST_ALL = 1000;
+
+async function getPage<T>(url: string, config: AxiosRequestConfig | undefined): Promise<ListResponse<T>> {
+  const body = await client.get<RawListResponse<T>>(url, config).then((r) => r.data);
+  const items = body?.data?.items ?? [];
+  return {
+    data: items,
+    meta: body?.data?.meta ?? { page: 1, limit: items.length, total: items.length },
+  };
+}
+
+/**
+ * list endpoint จริงของ backend ห่อ { items, meta } ไว้ใน data (src/lib/crudRoutes.ts → okList)
+ * ไม่ใช่ data: T[] ตรง ๆ — ฟังก์ชันนี้แกะให้เป็น ListResponse<T> ที่ ViewModel ทั้งแอปใช้อยู่แล้ว
+ * (`.data` = array, `.meta` = อยู่ระดับบนสุด) ทุก service ต้องเรียกอันนี้แทน http.get สำหรับ .list()
+ *
+ * params.limit > PAGE_MAX (เช่น LIST_ALL) → ขอทีละ PAGE_MAX จนครบจำนวนที่ขอหรือหมดข้อมูล
+ * (เริ่มจาก params.page ถ้ามี) · meta ที่คืน = { page, limit: ที่ขอ, total: ของ backend }
+ * หน้าแรกก่อน (ได้ total) แล้วหน้าที่เหลือยิง "พร้อมกัน" — เดิมไล่ทีละหน้า 300 รายการ = รอ backend 3 รอบต่อกัน
+ */
+async function getList<T>(url: string, config?: AxiosRequestConfig): Promise<ListResponse<T>> {
+  const params = (config?.params ?? {}) as Record<string, unknown>;
+  const wanted = Number(params.limit);
+  if (!Number.isFinite(wanted) || wanted <= PAGE_MAX) return getPage<T>(url, config);
+
+  const startPage = Math.max(1, Number(params.page) || 1);
+  const pageOf = (page: number) => getPage<T>(url, { ...config, params: { ...params, page, limit: PAGE_MAX } });
+  const first = await pageOf(startPage);
+  const total = first.meta.total;
+  // หมดข้อมูลในหน้าแรก (หน้าไม่เต็ม / ครบ total) · endpoint ที่ไม่แบ่งหน้าคืนทั้งหมดในรอบเดียว (ได้ ≠ PAGE_MAX) → จบ ไม่ขอซ้ำ
+  if (first.data.length !== PAGE_MAX || startPage * PAGE_MAX >= total) {
+    return { data: first.data.slice(0, wanted), meta: { page: startPage, limit: wanted, total } };
+  }
+  const lastPage = Math.min(Math.ceil(total / PAGE_MAX), startPage - 1 + Math.ceil(wanted / PAGE_MAX));
+  const rest = await Promise.all(Array.from({ length: lastPage - startPage }, (_, i) => pageOf(startPage + 1 + i)));
+  const data = [first, ...rest].flatMap((r) => r.data);
+  return { data: data.slice(0, wanted), meta: { page: startPage, limit: wanted, total } };
+}
+
+/** facade — คืน body ของ response (envelope { data, meta } / { data }) ตรง ๆ */
+export const http = {
+  get:    <T>(url: string, config?: AxiosRequestConfig) => client.get<T>(url, config).then((r) => r.data),
+  getList,
+  post:   <T>(url: string, body?: unknown, config?: AxiosRequestConfig) => client.post<T>(url, body, config).then((r) => r.data),
+  patch:  <T>(url: string, body?: unknown, config?: AxiosRequestConfig) => client.patch<T>(url, body, config).then((r) => r.data),
+  put:    <T>(url: string, body?: unknown, config?: AxiosRequestConfig) => client.put<T>(url, body, config).then((r) => r.data),
+  delete: <T>(url: string, config?: AxiosRequestConfig) => client.delete<T>(url, config).then((r) => r.data),
+  /** axios instance ตรง ๆ — สำหรับกรณีพิเศษที่ facade ไม่พอ (ตอนนี้ยังไม่มีผู้ใช้) */
+  raw: client,
+};
+
+/** ส่วนของ http ที่ service อ่านข้อมูลใช้ — ให้ส่ง client ที่ตั้งค่าพิเศษเข้า service ได้ (ดู withConfig) */
+export type HttpReader = Pick<typeof http, "get" | "getList">;
+
+/**
+ * http ที่ทุก request แนบ config เพิ่ม — ใช้ฝั่ง server ดึงข้อมูลแทนผู้ใช้ที่ login อยู่
+ * เช่น withConfig({ headers: { cookie }, fetchOptions: { cache: "no-store" } }) (src/lib/serverAuth.ts)
+ * ⚠️ ข้อมูลรายคนต้อง no-store เสมอ — ค่าเริ่มต้นฝั่ง server แคช 60 วิ (สำหรับ /catalog/* สาธารณะ)
+ */
+export function withConfig(extra: AxiosRequestConfig): HttpReader {
+  const merge = (c?: AxiosRequestConfig): AxiosRequestConfig => ({
+    ...extra,
+    ...c,
+    headers: { ...(extra.headers as object), ...(c?.headers as object) },
+  });
+  return {
+    get: (url, c) => http.get(url, merge(c)),
+    getList: (url, c) => getList(url, merge(c)),
+  };
+}

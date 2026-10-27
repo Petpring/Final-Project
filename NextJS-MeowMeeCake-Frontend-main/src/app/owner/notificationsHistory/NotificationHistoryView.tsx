@@ -1,0 +1,196 @@
+"use client";
+// View ของ Notification History — ตารางประวัติแจ้งเตือน + drawer รายละเอียด
+import dynamic from "next/dynamic";
+import { useTranslations, useLocale } from "next-intl";
+import { useOpenedOnce } from "@/hooks/useOpenedOnce";
+import { Button, Select, Tag } from "@/components/base";
+import { ListPageLayout } from "@/components/shared/layout";
+import { StatCard, StatCardsGrid } from "@/components/shared/stats";
+import { ConfirmDeletePopup, LoadFailed } from "@/components/shared/feedback";
+import { DataTable, FilterToolbar, SearchInput, TypeTabBar, type Column, FilterField } from "@/components/shared/data";
+import { formatDate } from "@/i18n/format";
+import { NOTIFICATION_TYPE_COLOR, READ_STATUS_CONFIG } from "@/constants/enumConfig";
+import { NOTIFICATION_MODULES, type NotificationDTO } from "@/types/notification";
+import type { NotificationType } from "@/types";
+import { DeleteButton, actionIcon } from "@/components/shared/actions";
+import type { useNotificationHistoryViewModel } from "./useNotificationHistoryViewModel";
+import { LineStatusTag } from "./_components/LineStatusTag";
+
+// ลิ้นชักรายละเอียดแยก chunk — โหลดเมื่อเปิดครั้งแรก (ลิ้นชักไม่ render ฝั่ง server อยู่แล้ว)
+const DetailModal = dynamic(() => import("@/components/shared/feedback/DetailModal").then((m) => m.DetailModal), { ssr: false });
+const NotificationDetailContent = dynamic(() => import("./_components/NotificationDetailContent").then((m) => m.NotificationDetailContent), { ssr: false });
+
+type VM = ReturnType<typeof useNotificationHistoryViewModel>;
+
+// ตัวกรองหมวด = หมวดที่ backend ยังสร้างอยู่ (ไม่มี "employee" ที่เลิกใช้ — ดู types/notification.ts)
+// "customer" = ลูกค้าติดต่อร้าน · ลูกค้ายกเลิกออเดอร์ ฯลฯ (backend customer-backend-merge.md §8.17)
+const MODULES = NOTIFICATION_MODULES;
+const TYPES: NotificationType[] = ["warning", "info", "success", "error"];
+
+export function NotificationHistoryView(vm: VM) {
+  const t = useTranslations();
+  const drawerUsed = useOpenedOnce(vm.drawerOpen);
+  const locale = useLocale();
+
+  const columns: Column<NotificationDTO>[] = [
+    {
+      key: "dot",
+      title: "",
+      width: 8,
+      render: (n) => (!n.is_read ? <span className="inline-block h-2 w-2 rounded-full bg-blue-500" /> : null),
+    },
+    {
+      key: "type",
+      title: t("notifications.colType"),
+      render: (n) => (
+        <span className="text-sm font-medium" style={{ color: NOTIFICATION_TYPE_COLOR[n.type] }}>
+          {t(`enums.notificationType.${n.type}`)}
+        </span>
+      ),
+    },
+    {
+      key: "content",
+      title: t("notifications.colContent"),
+      render: (n) => (
+        <div>
+          <p className={n.is_read ? "text-gray-600" : "font-semibold text-brown-800"}>{n.title}</p>
+          <p className="mt-0.5 line-clamp-1 text-xs text-gray-500">{n.message}</p>
+        </div>
+      ),
+    },
+    {
+      key: "module",
+      title: t("notifications.colModule"),
+      render: (n) => <Tag>{t(`enums.notificationModule.${n.module}`)}</Tag>,
+    },
+    {
+      key: "time",
+      title: t("notifications.colTime"),
+      render: (n) => formatDate(n.created_at, locale, { withTime: true }),
+    },
+    {
+      key: "status",
+      title: t("notifications.colStatus"),
+      render: (n) => (
+        <Tag color={READ_STATUS_CONFIG[n.is_read ? "read" : "unread"].antColor}>
+          {n.is_read ? t("notifications.statusRead") : t("notifications.statusUnread")}
+        </Tag>
+      ),
+    },
+    {
+      key: "line",
+      title: t("notifications.colLine"),
+      render: (n) => <LineStatusTag notif={n} />,
+    },
+  ];
+
+  return (
+    <ListPageLayout
+      title={t("notifications.historyTitle")}
+      actions={
+        <>
+          {vm.stats.unread > 0 && (
+            <Button icon={actionIcon("confirm")} onClick={vm.onMarkAllRead}>
+              {t("notifications.markAllRead")}
+            </Button>
+          )}
+          {vm.canDelete && vm.stats.total > 0 && (
+            <Button danger icon={actionIcon("delete")} onClick={vm.onClearAll}>
+              {t("notifications.clearAll")}
+            </Button>
+          )}
+        </>
+      }
+      toolbar={
+        <FilterToolbar
+          left={
+            <>
+              <TypeTabBar
+                value={vm.tab}
+                onChange={vm.setTab}
+                options={[
+                  { value: "all", label: t("notifications.tabAll") },
+                  { value: "unread", label: t("notifications.tabUnread") },
+                  { value: "read", label: t("notifications.tabRead") },
+                ]}
+              />
+              <SearchInput value={vm.search} onChange={vm.setSearch} placeholder={t("notifications.searchPlaceholder")} />
+            </>
+          }
+          // ตัวกรองชิดขวา (ช่องค้นหา/แท็บอยู่ซ้าย) — แบบเดียวกับหน้าพนักงาน
+          right={
+            <>
+              <FilterField label={t("filterLabel.module")} minWidth={150}>
+                <Select
+                  value={vm.moduleFilter}
+                  onChange={(v) => vm.setModuleFilter(v as VM["moduleFilter"])}
+                  options={[
+                    { value: "all", label: t("notifications.allModules") },
+                    ...MODULES.map((m) => ({ value: m, label: t(`enums.notificationModule.${m}`) })),
+                  ]}
+                />
+              </FilterField>
+              <FilterField label={t("filterLabel.notificationType")} minWidth={140}>
+                <Select
+                  value={vm.typeFilter}
+                  onChange={(v) => vm.setTypeFilter(v as VM["typeFilter"])}
+                  options={[
+                    { value: "all", label: t("notifications.allTypes") },
+                    ...TYPES.map((ty) => ({ value: ty, label: t(`enums.notificationType.${ty}`) })),
+                  ]}
+                />
+              </FilterField>
+            </>
+          }
+        />
+      }
+    >
+      {vm.isError ? (
+        <LoadFailed onRetry={vm.refetch} />
+      ) : (
+        <div className="flex flex-col gap-5">
+          <StatCardsGrid>
+            <StatCard label={t("notifications.statTotal")} value={vm.stats.total} sub={t("notifications.statTotalSub")} />
+            <StatCard label={t("notifications.statUnread")} value={vm.stats.unread} sub={t("notifications.statUnreadSub")} tone="warn" />
+            <StatCard label={t("enums.notificationType.warning")} value={vm.stats.warning} sub={t("notifications.statWarningSub")} tone="warn" />
+            <StatCard label={t("enums.notificationType.error")} value={vm.stats.error} sub={t("notifications.statErrorSub")} tone="down" />
+          </StatCardsGrid>
+
+          <DataTable
+            columns={columns}
+            rows={vm.rows}
+            loading={vm.isLoading}
+            emptyText={t("notifications.empty")}
+            onRowClick={vm.openDetail}
+            actions={
+              vm.canDelete
+                ? (n) => (
+                    <ConfirmDeletePopup title={t("notifications.deleteConfirm")} onConfirm={() => vm.onDelete(n._id)}>
+                      <DeleteButton size="small" />
+                    </ConfirmDeletePopup>
+                  )
+                : undefined
+            }
+          />
+        </div>
+      )}
+
+      {drawerUsed && (
+        <DetailModal
+          open={vm.drawerOpen}
+          title={t("notifications.detailTitle")}
+          onClose={vm.closeDrawer}
+          footer={
+            vm.selected?.link ? (
+              <Button type="primary" block icon={actionIcon("external")} href={vm.selected.link}>
+                {t("notifications.goToLink")}
+              </Button>
+            ) : undefined
+          }
+        >
+          {vm.selected && <NotificationDetailContent notif={vm.selected} />}
+        </DetailModal>
+      )}
+    </ListPageLayout>
+  );
+}

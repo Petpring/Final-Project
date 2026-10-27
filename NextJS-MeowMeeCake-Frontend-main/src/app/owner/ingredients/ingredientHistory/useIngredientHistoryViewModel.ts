@@ -1,0 +1,119 @@
+"use client";
+// ─────────────────────────────────────────────────────────────
+// ViewModel ของ Ingredient History — log การเคลื่อนไหวสต็อกวัตถุดิบ (อ่านอย่างเดียว)
+// สร้าง transaction ทำที่หน้า Ingredient Stock (#10) — หน้านี้แค่ดูย้อนหลัง
+// ─────────────────────────────────────────────────────────────
+import { useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { INGREDIENTS_KEY, INGREDIENTS_PARAMS, INGREDIENT_TXNS_KEY, INGREDIENT_TXNS_PARAMS } from "../ingredientsQuery";
+import { ingredientTransactionsService } from "@/services/ingredientTransactions";
+import { ingredientsService } from "@/services/ingredients";
+import { usePermission } from "@/context/PermissionsContext";
+import type { IngredientTxnType } from "@/constants/enumConfig";
+import { refId } from "@/lib/refId";
+import { unitLabel } from "@/utils/unitContext";
+
+export interface HistoryRow {
+  _id: string;
+  createdAt: string;
+  ingredientName: string;
+  type: IngredientTxnType;
+  quantity: number;
+  unitAbbr: string;
+  note: string;
+  /** วันหมดอายุของล็อตที่รับเข้า (null = ไม่ได้ระบุ) */
+  expiryDate: string | null;
+  performedBy: string;
+}
+
+type TypeFilter = "all" | IngredientTxnType;
+
+export function useIngredientHistoryViewModel() {
+  // ingredients ไม่ใช่ stock — API ของหน้านี้ตรวจ ingredients.* (Final-Backlog P2)
+  const perm = usePermission("ingredient_history");
+
+  const [search, setSearch] = useState("");
+  const [typeFilter, setTypeFilter] = useState<TypeFilter>("all");
+  const [ingredientId, setIngredientId] = useState<string>("all");
+
+  const txnsQ = useQuery({
+    queryKey: INGREDIENT_TXNS_KEY,
+    queryFn: () => ingredientTransactionsService.list(INGREDIENT_TXNS_PARAMS),
+  });
+  const ingredientsQ = useQuery({
+    queryKey: INGREDIENTS_KEY,
+    queryFn: () => ingredientsService.list(INGREDIENTS_PARAMS),
+  });
+
+  const ingredients = ingredientsQ.data?.data ?? [];
+
+  const rows = useMemo<HistoryRow[]>(() => {
+    const ingMap = new Map(
+      (ingredientsQ.data?.data ?? []).map((i) => [
+        i._id,
+        { name: i.ingredient_name, unit: unitLabel(i.unit_id) },
+      ]),
+    );
+    return (txnsQ.data?.data ?? [])
+      .map((tx) => {
+        const ing = ingMap.get(refId(tx.ingredient_id));
+        const performedByName =
+          typeof tx.performed_by === "object" && tx.performed_by ? tx.performed_by.user_fullname : null;
+        return {
+          _id: tx._id,
+          // วันที่ทำรายการจริง (บันทึกย้อนหลังได้) — ข้อมูลเก่าไม่มีใช้เวลาที่บันทึก
+          createdAt: tx.transaction_date ?? tx.created_at,
+          expiryDate: tx.expiry_date ?? null,
+          ingredientName: ing?.name ?? "—",
+          type: tx.type,
+          quantity: tx.qty,
+          unitAbbr: ing?.unit ?? "",
+          note: tx.note ?? "",
+          performedBy: performedByName ?? "—",
+        };
+      })
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }, [txnsQ.data, ingredientsQ.data]);
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    const ingName =
+      ingredientId === "all"
+        ? null
+        : (ingredientsQ.data?.data ?? []).find((i) => i._id === ingredientId)?.ingredient_name ?? null;
+    return rows.filter((r) => {
+      const matchSearch =
+        !q ||
+        r.ingredientName.toLowerCase().includes(q) ||
+        r.note.toLowerCase().includes(q) ||
+        r.performedBy.toLowerCase().includes(q);
+      const matchType = typeFilter === "all" || r.type === typeFilter;
+      const matchIng = ingName === null || r.ingredientName === ingName;
+      return matchSearch && matchType && matchIng;
+    });
+  }, [rows, search, typeFilter, ingredientId, ingredientsQ.data]);
+
+  const stats = useMemo(
+    () => ({
+      total: rows.length,
+      receive: rows.filter((r) => r.type === "receive").length,
+      use: rows.filter((r) => r.type === "use").length,
+    }),
+    [rows],
+  );
+
+  return {
+    perm,
+    rows: filtered,
+    stats,
+    ingredients,
+    // isPending (ไม่ใช่ isLoading) — ตอน SSR ไม่มีข้อมูลจะเป็น "กำลังโหลด" ตรงกับ browser (หน้านี้ render ฝั่ง server)
+    isLoading: txnsQ.isPending || ingredientsQ.isPending,
+    isError: txnsQ.isError,
+    refetch: () => txnsQ.refetch(),
+
+    search, setSearch,
+    typeFilter, setTypeFilter,
+    ingredientId, setIngredientId,
+  };
+}

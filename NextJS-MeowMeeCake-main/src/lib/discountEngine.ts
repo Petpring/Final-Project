@@ -1,0 +1,151 @@
+/**
+ * discountEngine — คำนวณส่วนลดจากโปรโมชัน 1 ตัว เทียบกับรายการในออเดอร์
+ *
+ * ไม่ยุ่งกับ DB — รับ promotion doc + รายการที่ resolve แล้วเข้ามา คืนจำนวนเงินส่วนลด
+ * เงื่อนไขที่รองรับ: discount_type (Percentage/Amount/FreeShipping), applicable_products/categories,
+ *   min_order_amount, min_quantity, max_discount_amount, applicable_channels
+ *
+ * ⚠️ ไม่เช็ค is_active / ช่วงวันที่ / usage_limit / max_user_per_user — เป็นหน้าที่ของ promotionService
+ */
+import { badRequest, unprocessable } from "./httpError";
+import { round2 } from "./money";
+import { channelMismatchMessage, channelsOf, positiveLimit } from "./promoCode";
+
+export type DiscountType = "Percentage" | "Amount" | "FreeShipping";
+export type PromotionChannel = "online" | "instore";
+
+export interface DiscountLine {
+  product_id: string;
+  category_id?: string | null;
+  quantity: number;
+  line_total: number; // ราคารวมของรายการนี้ (unit_price * quantity)
+}
+
+export interface DiscountContext {
+  lines: DiscountLine[];
+  subtotal: number;
+  delivery_fee: number;
+  channel: PromotionChannel;
+}
+
+export interface DiscountResult {
+  promotion_id: string;
+  promotion_code: string;
+  discount_type: DiscountType;
+  /** จำนวนเงินส่วนลดรวม (รวมค่าส่งถ้าเป็น FreeShipping) — orderService ใช้: total = subtotal + delivery_fee - discount_amount */
+  discount_amount: number;
+  free_shipping: boolean;
+  /** ยอดของ "สินค้าที่ร่วมรายการ" ที่ใช้เป็นฐานคิด (= subtotal ถ้าไม่จำกัดสินค้า) */
+  eligible_amount: number;
+  /** ใช้ร่วมกับโปรอื่นในบิลเดียวได้ (orderService ตรวจตอนส่ง promotion_ids มากกว่า 1 ตัว) */
+  stackable: boolean;
+}
+
+/** field ที่ใช้จริงจาก promotion doc — lean() คืน object ดิบ ไม่ใช่ Mongoose document ที่ type ชัดเจน */
+export interface PromotionLike {
+  _id: unknown;
+  promotion_code: string;
+  discount_type: string;
+  discount_value?: number | null;
+  applicable_channels?: string[];
+  applicable_products?: unknown[];
+  applicable_categories?: unknown[];
+  min_order_amount?: number | null;
+  min_quantity?: number | null;
+  max_discount_amount?: number | null;
+  stackable?: boolean | null;
+}
+
+function idIn(list: unknown[] | undefined, id: string | null | undefined): boolean {
+  if (!list?.length || !id) return false;
+  return list.some((x) => String(x) === String(id));
+}
+
+export function computeDiscount(promo: PromotionLike, ctx: DiscountContext): DiscountResult {
+  const type = promo.discount_type as DiscountType;
+
+  // ── ช่องทาง ──
+  // [] (FrontOffice เขียนตรงลง DB) = ทุกช่องทาง — เดิม [] ทำให้ทุกช่องทางใช้ไม่ได้
+  const channels = channelsOf(promo);
+  if (!channels.includes(ctx.channel)) {
+    throw unprocessable(channelMismatchMessage(channels));
+  }
+
+  // ── หาว่ารายการไหน "ร่วมรายการ" ──
+  const hasProductScope = (promo.applicable_products?.length ?? 0) > 0;
+  const hasCategoryScope = (promo.applicable_categories?.length ?? 0) > 0;
+  const scoped = hasProductScope || hasCategoryScope;
+
+  const eligibleLines = scoped
+    ? ctx.lines.filter(
+        (l) =>
+          idIn(promo.applicable_products, l.product_id) ||
+          idIn(promo.applicable_categories, l.category_id)
+      )
+    : ctx.lines;
+
+  const eligibleAmount = round2(eligibleLines.reduce((s, l) => s + l.line_total, 0));
+  const eligibleQty = eligibleLines.reduce((s, l) => s + l.quantity, 0);
+
+  if (scoped && eligibleLines.length === 0) {
+    throw unprocessable("ไม่มีสินค้าที่ร่วมรายการโปรโมชันนี้ในออเดอร์");
+  }
+
+  // ── ขั้นต่ำ ──
+  const minAmount = positiveLimit(promo.min_order_amount);
+  const minQty = positiveLimit(promo.min_quantity);
+  if (minAmount != null && eligibleAmount < minAmount) {
+    throw unprocessable(
+      `ยอดสินค้าที่ร่วมรายการยังไม่ถึงขั้นต่ำ ${minAmount} บาท (ปัจจุบัน ${eligibleAmount})`
+    );
+  }
+  if (minQty != null && eligibleQty < minQty) {
+    throw unprocessable(
+      `ต้องมีสินค้าที่ร่วมรายการอย่างน้อย ${minQty} ชิ้น (ปัจจุบัน ${eligibleQty})`
+    );
+  }
+
+  // ── คิดส่วนลด ──
+  let discount = 0;
+  let freeShipping = false;
+
+  if (type === "Percentage") {
+    if (promo.discount_value == null) throw badRequest("โปรโมชันไม่มี discount_value");
+    discount = eligibleAmount * (Number(promo.discount_value) / 100);
+    // เพดานส่วนลดมีผลเฉพาะค่า > 0 — เดิม 0 (ฟอร์มที่เว้นว่างแล้วบันทึกเป็น 0) ตัดส่วนลดเหลือ 0 → "ส่วนลดเป็น 0" ทุกออเดอร์
+    const cap = positiveLimit(promo.max_discount_amount);
+    if (cap != null) discount = Math.min(discount, cap);
+  } else if (type === "Amount") {
+    discount = Math.min(Number(promo.discount_value ?? 0), eligibleAmount);
+  } else if (type === "FreeShipping") {
+    // ต้องมีค่าจัดส่งให้ลด — ออเดอร์รับเอง (takeaway) หรือออเดอร์ที่ได้ส่งฟรีอยู่แล้ว delivery_fee = 0
+    // ถ้าปล่อยผ่านจะได้ discount = 0 แต่ออเดอร์ยังผูก promotion_id โดยไม่บันทึก usage → reject ไปเลย
+    if (!(ctx.delivery_fee > 0)) {
+      throw unprocessable(
+        "โปรโมชันส่งฟรีใช้ได้เฉพาะออเดอร์แบบจัดส่งที่มีค่าจัดส่งเท่านั้น (ออเดอร์รับเอง หรือออเดอร์ที่ได้ส่งฟรีอยู่แล้ว ใช้ไม่ได้)"
+      );
+    }
+    freeShipping = true;
+    discount = ctx.delivery_fee;
+  } else {
+    throw badRequest(`discount_type ไม่รองรับ: ${type}`);
+  }
+
+  discount = round2(Math.max(0, discount));
+
+  // ส่วนลดออกมา 0 (เช่น discount_value = 0, eligibleAmount น้อยมาก, หรือ config ผิด) —
+  // ถ้าปล่อยผ่านออเดอร์จะผูก promotion_id โดยไม่บันทึก usage → reject เหมือนกรณี FreeShipping
+  if (discount <= 0) {
+    throw unprocessable("โปรโมชันนี้ไม่ให้ส่วนลดกับออเดอร์นี้ (ส่วนลดเป็น 0)");
+  }
+
+  return {
+    promotion_id: String(promo._id),
+    promotion_code: promo.promotion_code,
+    discount_type: type,
+    discount_amount: discount,
+    free_shipping: freeShipping,
+    eligible_amount: eligibleAmount,
+    stackable: promo.stackable === true,
+  };
+}

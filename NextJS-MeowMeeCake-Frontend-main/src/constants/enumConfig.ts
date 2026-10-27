@@ -1,0 +1,358 @@
+// ─────────────────────────────────────────────────────────────
+// src/constants/enumConfig.ts
+// สี / flow ของ enum ต่าง ๆ — **ไม่มีข้อความ label** (label อยู่ i18n namespace "enums")
+//
+// ใช้คู่ i18n:
+//   const t = useTranslations("enums.orderStatus");
+//   <StatusBadge color={ORDER_STATUS_CONFIG[s].antColor} label={t(s)} />
+// ─────────────────────────────────────────────────────────────
+import type { ProductKind } from "@/types/product";
+
+/** ชื่อสีของ antd <Tag color> / <Badge status> */
+export type AntColor =
+  | "default" | "success" | "processing" | "warning" | "error"
+  | "purple" | "orange" | "blue" | "gold" | "green" | "red";
+
+interface StatusStyle {
+  color: string;
+  antColor: AntColor;
+  bg?: string;
+  text?: string;
+}
+
+// ─── ออเดอร์ ─────────────────────────────────────────────────
+export type OrderStatus =
+  | "pending" | "confirmed" | "preparing" | "ready" | "completed" | "cancelled";
+
+export const ORDER_STATUS_FLOW: OrderStatus[] = [
+  "pending", "confirmed", "preparing", "ready", "completed",
+];
+
+export const ORDER_STATUS_CONFIG: Record<OrderStatus, StatusStyle> = {
+  pending:   { color: "#b45309", antColor: "warning" },
+  confirmed: { color: "#1d4ed8", antColor: "processing" },
+  preparing: { color: "#7c3aed", antColor: "purple" },
+  ready:     { color: "#c2410c", antColor: "orange" },
+  completed: { color: "#15803d", antColor: "success" },
+  cancelled: { color: "#dc2626", antColor: "error" },
+};
+
+export type PaymentStatus = "pending" | "paid" | "failed" | "refunded";
+
+export const PAYMENT_STATUS_CONFIG: Record<PaymentStatus, StatusStyle> = {
+  pending:  { color: "#b45309", antColor: "warning" },
+  paid:     { color: "#15803d", antColor: "success" },
+  failed:   { color: "#dc2626", antColor: "error" },
+  refunded: { color: "#475569", antColor: "default" },
+};
+
+// ─── สถานะจัดส่ง (เฉพาะ order_type = "delivery") — orderModel/preorderModel.delivery_status ───
+export type DeliveryStatus = "pending" | "shipping" | "delivered" | "failed";
+
+export const DELIVERY_STATUSES: DeliveryStatus[] = ["pending", "shipping", "delivered", "failed"];
+
+export const DELIVERY_STATUS_CONFIG: Record<DeliveryStatus, StatusStyle> = {
+  pending:   { color: "#b45309", antColor: "warning" },
+  shipping:  { color: "#1d4ed8", antColor: "processing" },
+  delivered: { color: "#15803d", antColor: "success" },
+  failed:    { color: "#dc2626", antColor: "error" },
+};
+
+// ─── บริษัทขนส่ง (orderModel/preorderModel.shipping_carrier — ตรงกับ backend lib/shippingCarrier.ts) ───
+export const SHIPPING_CARRIERS = [
+  "thailand_post", "kerry", "flash", "jt", "ninjavan", "best",
+  "scg", "lalamove", "grab", "lineman", "store", "other",
+] as const;
+
+export type ShippingCarrier = (typeof SHIPPING_CARRIERS)[number];
+
+// ─── การผลิต ─────────────────────────────────────────────────
+export type ProductionStatus = "planned" | "in_progress" | "done" | "cancelled";
+
+export const PRODUCTION_STATUS_FLOW: ProductionStatus[] = ["planned", "in_progress", "done"];
+
+export const PRODUCTION_STATUS_CONFIG: Record<ProductionStatus, StatusStyle> = {
+  planned:     { color: "#64748b", antColor: "default",    bg: "#f1f5f9", text: "#64748b" },
+  in_progress: { color: "#1d4ed8", antColor: "processing", bg: "#dbeafe", text: "#1d4ed8" },
+  done:        { color: "#15803d", antColor: "success",    bg: "#dcfce7", text: "#15803d" },
+  cancelled:   { color: "#dc2626", antColor: "error",      bg: "#fee2e2", text: "#dc2626" },
+};
+
+export type ProductionItemStatus = "pending" | "in_progress" | "done" | "cancelled";
+
+export const PRODUCTION_ITEM_STATUS_CONFIG: Record<ProductionItemStatus, StatusStyle> = {
+  pending:     { color: "#f59e0b", antColor: "warning" },
+  in_progress: { color: "#3b82f6", antColor: "processing" },
+  done:        { color: "#22c55e", antColor: "success" },
+  cancelled:   { color: "#ef4444", antColor: "error" },
+};
+
+export type SourceType = "manual" | "preorder";
+
+export const SOURCE_TYPE_CONFIG: Record<SourceType, { color: string; bg: string }> = {
+  manual:   { color: "#7c3aed", bg: "#ede9fe" },
+  preorder: { color: "#1d4ed8", bg: "#dbeafe" },
+};
+
+// ─── ประเภทสินค้า (ProductKind — derive จาก Product.is_preorder) ──────
+// ป้ายบนมุมรูปของการ์ดสินค้า — สินค้าปกติใช้โทนน้ำตาลของแบรนด์ (brown-600 บน brown-100)
+export const PRODUCT_TYPE_CONFIG: Record<ProductKind, { color: string; bg: string; antColor: AntColor }> = {
+  normal:   { color: "#7C4F35", bg: "#F1E4DC", antColor: "success" },
+  preorder: { color: "#7c3aed", bg: "#ede9fe", antColor: "processing" },
+};
+
+// ─── สต็อกวัตถุดิบ ───────────────────────────────────────────
+export type StockStatus = "ok" | "low" | "out";
+
+export const STOCK_STATUS_CONFIG: Record<StockStatus, StatusStyle & { dotColor: string }> = {
+  ok:  { color: "#15803d", antColor: "success", dotColor: "#22c55e", bg: "#dcfce7", text: "#15803d" },
+  low: { color: "#b45309", antColor: "warning", dotColor: "#f59e0b", bg: "#fef3c7", text: "#b45309" },
+  // ตัวอักษร red-700 — #dc2626 บน #fee2e2 คอนทราสต์ 3.95:1 ไม่ถึง 4.5:1 (ป้าย "หมดสต็อก") · จุด/แถบยังใช้สีสดเดิม
+  out: { color: "#b91c1c", antColor: "error",   dotColor: "#ef4444", bg: "#fee2e2", text: "#b91c1c" },
+};
+
+export function stockProgressColor(status: StockStatus): string {
+  return STOCK_STATUS_CONFIG[status].dotColor;
+}
+
+export type IngredientTxnType = "use" | "receive" | "adjust";
+
+export const INGREDIENT_TXN_CONFIG: Record<IngredientTxnType, { color: string; bg: string; sign: "+" | "-" }> = {
+  use:     { color: "#be185d", bg: "#fce7f3", sign: "-" },
+  receive: { color: "#15803d", bg: "#dcfce7", sign: "+" },
+  adjust:  { color: "#b45309", bg: "#fef3c7", sign: "-" },
+};
+
+// ─── ช่องทางขาย / โปรโมชัน ───────────────────────────────────
+export type SalesChannel = "online" | "walkin";
+
+export const SALES_CHANNEL_CONFIG: Record<SalesChannel, { color: string; bg: string }> = {
+  online: { color: "#1d4ed8", bg: "#dbeafe" },
+  walkin: { color: "#7c3aed", bg: "#ede9fe" },
+};
+
+export type PromotionChannel = "online" | "instore";
+
+// ─── หมวดสูตรย่อย (ค่าเก็บใน DB เป็นไทย — label มาจาก i18n enums.recipeCategory) ──
+export type RecipeCategory = "เนื้อเค้ก" | "ครีม" | "ไส้" | "ท็อปปิ้ง" | "แป้ง" | "อื่นๆ";
+
+export const RECIPE_CATEGORIES: RecipeCategory[] = ["เนื้อเค้ก", "ครีม", "ไส้", "ท็อปปิ้ง", "แป้ง", "อื่นๆ"];
+
+export const RECIPE_CATEGORY_COLORS: Record<RecipeCategory, { bg: string; text: string }> = {
+  "เนื้อเค้ก": { bg: "#fce7f3", text: "#be185d" },
+  "ครีม":      { bg: "#dbeafe", text: "#1d4ed8" },
+  "ไส้":       { bg: "#d1fae5", text: "#15803d" },
+  "ท็อปปิ้ง":  { bg: "#fef3c7", text: "#b45309" },
+  "แป้ง":      { bg: "#ede9fe", text: "#7c3aed" },
+  "อื่นๆ":     { bg: "#f1f5f9", text: "#64748b" },
+};
+
+// ─── แบนเนอร์หน้าร้าน ───────────────────────────────────────
+// คำนวณฝั่ง frontend จาก is_active + start_date/end_date (ไม่มีใน DB) — ดู bannerForm.ts getBannerStatus()
+export type BannerStatus = "active" | "scheduled" | "inactive" | "expired";
+
+export const BANNER_STATUS_CONFIG: Record<BannerStatus, StatusStyle> = {
+  active:    { color: "#15803d", antColor: "success" },
+  scheduled: { color: "#b45309", antColor: "warning" },
+  inactive:  { color: "#64748b", antColor: "default" },
+  expired:   { color: "#dc2626", antColor: "error" },
+};
+
+// ─── บันทึกการทำงานของพนักงาน (audit log) ───────────────────
+// ตรงกับ enum จริงของ backend (src/models/userLogModel.ts action_type) — มี LOGIN/LOGOUT ด้วย
+export type UserLogAction = "CREATE" | "READ" | "UPDATE" | "DELETE" | "LOGIN" | "LOGOUT" | "OTHER";
+
+export const USER_LOG_ACTION_CONFIG: Record<UserLogAction, { color: string; bg: string }> = {
+  CREATE: { color: "#15803d", bg: "#dcfce7" },
+  READ:   { color: "#475569", bg: "#f1f5f9" },
+  UPDATE: { color: "#b45309", bg: "#fef3c7" },
+  DELETE: { color: "#dc2626", bg: "#fee2e2" },
+  LOGIN:  { color: "#0369a1", bg: "#e0f2fe" },
+  LOGOUT: { color: "#64748b", bg: "#f1f5f9" },
+  OTHER:  { color: "#7c3aed", bg: "#ede9fe" },
+};
+
+// ─── ค่าใช้จ่ายร้าน (ค่าเก็บใน DB เป็นไทย — label = i18n enums.expenseCategory) ──
+export type ExpenseCategory =
+  | "วัตถุดิบ" | "บรรจุภัณฑ์" | "ค่าจ้างแรงงาน" | "ค่าสาธารณูปโภค"
+  | "ค่าเช่า" | "ค่าการตลาด" | "ค่าซ่อมบำรุง" | "อื่นๆ";
+
+export const EXPENSE_CATEGORIES: ExpenseCategory[] = [
+  "วัตถุดิบ", "บรรจุภัณฑ์", "ค่าจ้างแรงงาน", "ค่าสาธารณูปโภค",
+  "ค่าเช่า", "ค่าการตลาด", "ค่าซ่อมบำรุง", "อื่นๆ",
+];
+
+/** หมวดที่นับเป็นต้นทุนขาย (COGS) — ที่เหลือถือเป็นค่าใช้จ่ายดำเนินงาน (OPEX) ดู Finance P&L */
+export const COGS_EXPENSE_CATEGORIES: ExpenseCategory[] = ["วัตถุดิบ", "บรรจุภัณฑ์"];
+
+export const EXPENSE_CATEGORY_CONFIG: Record<ExpenseCategory, { color: string; bg: string }> = {
+  "วัตถุดิบ":        { color: "#1d4ed8", bg: "#dbeafe" },
+  "บรรจุภัณฑ์":      { color: "#15803d", bg: "#dcfce7" },
+  "ค่าจ้างแรงงาน":   { color: "#7c3aed", bg: "#ede9fe" },
+  "ค่าสาธารณูปโภค":  { color: "#b45309", bg: "#fef3c7" },
+  "ค่าเช่า":         { color: "#dc2626", bg: "#fee2e2" },
+  "ค่าการตลาด":      { color: "#c2410c", bg: "#ffedd5" },
+  "ค่าซ่อมบำรุง":    { color: "#0891b2", bg: "#cffafe" },
+  "อื่นๆ":           { color: "#64748b", bg: "#f1f5f9" },
+};
+
+/** วิธีชำระที่ร้านจ่ายให้ผู้ขาย/ค่าใช้จ่าย (ค่าเก็บใน DB เป็นไทย — คนละความหมายกับ POS `PaymentMethod` "cash"/"qr") */
+export type ExpensePaymentMethod = "เงินสด" | "โอนเงิน" | "บัตรเครดิต" | "QR Code";
+
+export const EXPENSE_PAYMENT_METHODS: ExpensePaymentMethod[] = ["เงินสด", "โอนเงิน", "บัตรเครดิต", "QR Code"];
+
+// ─── การแจ้งเตือน ───────────────────────────────────────────
+export const NOTIFICATION_TYPE_COLOR: Record<"warning" | "info" | "success" | "error", string> = {
+  warning: "#f59e0b",
+  info:    "#3b82f6",
+  success: "#22c55e",
+  error:   "#ef4444",
+};
+
+// ─── คูปอง/ส่วนลด (Promotion) ────────────────────────────────
+// ตรงกับ backend จริง (promotionModel.ts discount_type) เอกพจน์ตัวใหญ่นำเสมอ
+export type DiscountType = "Percentage" | "Amount" | "FreeShipping";
+
+export const DISCOUNT_TYPE_CONFIG: Record<DiscountType, { color: string }> = {
+  Percentage:   { color: "#16a34a" },
+  Amount:       { color: "#1d4ed8" },
+  FreeShipping: { color: "#7c3aed" },
+};
+
+// "active/scheduled/inactive" คำนวณฝั่ง frontend จาก is_active + start_date/end_date (ไม่มีใน DB
+// ตรง ๆ) "expired" เพิ่มมาจากการเทียบ end_date กับวันนี้ — ดู couponForm.ts deriveCouponStatus()
+export type CouponStatus = "active" | "scheduled" | "inactive" | "expired";
+
+export const COUPON_STATUS_CONFIG: Record<CouponStatus, StatusStyle> = {
+  active:    { color: "#15803d", antColor: "success" },
+  scheduled: { color: "#b45309", antColor: "warning" },
+  inactive:  { color: "#64748b", antColor: "default" },
+  expired:   { color: "#dc2626", antColor: "error" },
+};
+
+// ─── รอบพรีออเดอร์ (PreorderRound) ────────────────────────────
+// ตรงกับ backend จริง (preorderRoundService.ts ROUND_STATUSES/NEXT_ROUND_STATUS)
+// scheduled → open → closed (เดินหน้าตามลำดับ) ; scheduled|open → cancelled (ยกเลิกได้)
+export type RoundStatus = "scheduled" | "open" | "closed" | "cancelled";
+
+export const ROUND_STATUS_FLOW: RoundStatus[] = ["scheduled", "open", "closed"];
+
+export const ROUND_STATUS_CONFIG: Record<RoundStatus, StatusStyle> = {
+  scheduled: { color: "#64748b", antColor: "default" },
+  open:      { color: "#15803d", antColor: "success" },
+  closed:    { color: "#b45309", antColor: "warning" },
+  cancelled: { color: "#dc2626", antColor: "error" },
+};
+
+// ─── ผลวิเคราะห์ความรู้สึกจากรีวิว (SentimentResults) ─────────
+export type SentimentLabel = "Positive" | "Negative" | "Neutral";
+
+export const SENTIMENT_LABEL_CONFIG: Record<SentimentLabel, StatusStyle> = {
+  Positive: { color: "#15803d", antColor: "success" },
+  Negative: { color: "#dc2626", antColor: "error" },
+  Neutral:  { color: "#64748b", antColor: "default" },
+};
+
+// ─── บทบาทพนักงาน (ป้ายข้างชื่อบทบาท) ────────────────────────
+// ใช้ 2 ที่: หัวแผงสิทธิ์ (PermissionsView) · รายการบทบาทด้านซ้าย (RoleListPanel)
+export type RoleTypeKind = "owner" | "staff" | "customer";
+
+export const ROLE_TYPE_CONFIG: Record<RoleTypeKind, StatusStyle> = {
+  // antColor "purple" — แท็ก gold ของ antd ตัวอักษรบนพื้นได้คอนทราสต์แค่ 2.75:1 (Lighthouse Accessibility ตก) · purple 8.9:1
+  owner:    { color: "#a16207", antColor: "purple" },
+  staff:    { color: "#1d4ed8", antColor: "blue" },
+  customer: { color: "#475569", antColor: "default" },
+};
+
+// ─── สถานะการทำงานของพนักงาน ─────────────────────────────────
+export type EmployeeWorking = "working" | "left";
+
+export const EMPLOYEE_WORKING_CONFIG: Record<EmployeeWorking, StatusStyle> = {
+  working: { color: "#15803d", antColor: "success" },
+  left:    { color: "#475569", antColor: "default" },
+};
+
+// ─── อ่านแล้ว / ยังไม่อ่าน (ประวัติการแจ้งเตือน) ─────────────
+export type ReadStatus = "read" | "unread";
+
+export const READ_STATUS_CONFIG: Record<ReadStatus, StatusStyle> = {
+  read:   { color: "#475569", antColor: "default" },
+  unread: { color: "#1d4ed8", antColor: "processing" },
+};
+
+// ─── ผลการส่ง LINE ถึงเจ้าของร้าน (ประวัติการแจ้งเตือน · owner/notificationsHistory/lineStatus.ts) ──
+export type LineDeliveryStatus = "sent" | "failed" | "webOnly";
+
+export const LINE_DELIVERY_CONFIG: Record<LineDeliveryStatus, StatusStyle> = {
+  sent:    { color: "#15803d", antColor: "success" },
+  failed:  { color: "#b91c1c", antColor: "error" },
+  webOnly: { color: "#475569", antColor: "default" },
+};
+
+// ─── สถานะรีวิวลูกค้า — ค่าตรงกับ ReviewStatus ใน types/review.ts ──
+// (status กับ is_visible เปลี่ยนคู่กัน: approved = แสดง · hidden = ซ่อน)
+export const REVIEW_STATUS_CONFIG: Record<"approved" | "pending" | "hidden", StatusStyle> = {
+  approved: { color: "#15803d", antColor: "success" },
+  pending:  { color: "#b45309", antColor: "warning" },
+  hidden:   { color: "#475569", antColor: "default" },
+};
+
+// ─── กลุ่มการชำระเงินของออเดอร์ในรอบพรีออเดอร์ (แท็บสรุปรอบ) ──
+export type PaymentGroup = "paid" | "pending" | "cancelled";
+
+export const PAYMENT_GROUP_CONFIG: Record<PaymentGroup, StatusStyle> = {
+  paid:      { color: "#15803d", antColor: "success" },
+  pending:   { color: "#b45309", antColor: "warning" },
+  cancelled: { color: "#475569", antColor: "default" },
+};
+
+// ─── โซนค่าจัดส่งหน้าร้านออนไลน์ — ไล่สีจากใกล้ไปไกล ─────────
+export const SHIPPING_ZONE_CONFIG: Record<"A" | "B" | "C" | "D", StatusStyle> = {
+  A: { color: "#15803d", antColor: "green" },
+  B: { color: "#1d4ed8", antColor: "blue" },
+  C: { color: "#a16207", antColor: "gold" },
+  D: { color: "#475569", antColor: "default" },
+};
+
+/** โซนที่เพิ่มเอง (E, F, …) — วนสีชุดนี้ตามตัวอักษร */
+const EXTRA_ZONE_STYLES: StatusStyle[] = [
+  { color: "#7e22ce", antColor: "purple" },
+  { color: "#c2410c", antColor: "orange" },
+  { color: "#0369a1", antColor: "processing" },
+];
+
+/** สีป้ายโซนค่าส่ง — A–D ตามชุดหลัก · โซนอื่นวนสีเพิ่ม */
+export function shippingZoneStyle(code: string): StatusStyle {
+  return (
+    SHIPPING_ZONE_CONFIG[code as keyof typeof SHIPPING_ZONE_CONFIG] ??
+    EXTRA_ZONE_STYLES[Math.max(0, code.charCodeAt(0) - 69) % EXTRA_ZONE_STYLES.length]
+  );
+}
+
+// ─── ป้ายที่ไม่ใช่ enum แต่ใช้ซ้ำหลายหน้า ────────────────────
+// อยู่ที่นี่เพราะความหมายเดียวกันต้องได้สีเดียวกันทุกหน้า — เดิมพิมพ์ชื่อสีซ้ำกันคนละไฟล์
+export const NOTICE_TAG: Record<
+  "awaitingRefund" | "cancelled" | "catchAllZone" | "inactive" | "roleName" | "negativeFilter" | "missingRecipe",
+  AntColor
+> = {
+  /** "รอคืนเงิน" — ตารางจัดการออเดอร์ · แท็บออเดอร์ของรอบพรีออเดอร์ */
+  awaitingRefund: "warning",
+  /** แถบ "ออเดอร์ถูกยกเลิก" ใน drawer รายละเอียด (ออเดอร์ + พรีออเดอร์) */
+  cancelled: "error",
+  /** โซน "จังหวัดอื่นทั้งหมด" — โซนค่าจัดส่ง (POS) · ค่าส่งหน้าร้านออนไลน์ */
+  catchAllZone: "gold",
+  /** รายการที่ปิดใช้งานแล้ว เช่น สินค้าในรอบพรีออเดอร์ */
+  inactive: "default",
+  /** ชิปชื่อบทบาทในตารางพนักงาน (แถวมีแค่ชื่อ ไม่มี role_type ให้แยกสี) */
+  roleName: "blue",
+  /** ชิปตัวกรอง "เฉพาะรีวิวแง่ลบ" ที่กดปิดได้ — หน้ารีวิวลูกค้า */
+  negativeFilter: "red",
+  /** สินค้าที่ยังไม่มีสูตร — ตารางดูล่วงหน้าในฟอร์มสร้างใบสั่งผลิตจากรอบ (สร้างไม่ได้จนกว่าจะผูกสูตร) */
+  missingRecipe: "error",
+};
+
+// ─── สถานะการเชื่อมบัญชี LINE (หน้าโปรไฟล์) ──────────────────
+export const LINK_STATUS_CONFIG: Record<"linked" | "unlinked", StatusStyle> = {
+  linked:   { color: "#15803d", antColor: "success" },
+  unlinked: { color: "#475569", antColor: "default" },
+};

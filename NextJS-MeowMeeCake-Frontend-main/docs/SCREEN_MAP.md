@@ -1,0 +1,153 @@
+# Screen Map — สถานะการ wire ของทุกหน้า (หลังร้าน + หน้าร้าน)
+
+> **เอกสารนี้คืออะไร:** ความจริงเรื่อง **reachability/wiring** ของแต่ละหน้า — มี route ไหม เข้าถึงได้ทางไหน (sidebar/ปุ่ม/redirect) มี menuKey/permission/breadcrumb/i18n ครบไหม
+> **เปิดอ่านเมื่อ:** ก่อนเริ่ม/หลังจบ screen ใดในเฟส 4 · สงสัยว่าทำไมกดเมนูแล้วไปหน้าอื่น/404 · เช็คว่าลืมต่อสายอะไรไหม
+> **ความสัมพันธ์กับเอกสารอื่น:** `REBUILD_PLAN.md` §7 = route/template/component ต่อหน้า (ของ "จะสร้างอะไร") · `COMPONENT_MAP.md` = ทะเบียน component (ของ "component อยู่ไหน") · **เอกสารนี้ = เข้าถึงหน้านั้นได้จริงหรือยัง**
+>
+> อัปเดตล่าสุด: 2026-10-10 (เพิ่ม #36 โซนค่าจัดส่ง · #37 ค่าจัดส่งหน้าร้านออนไลน์ · แท็บสรุปรอบใน #28 · §2c ทางเข้าตามเมนูบัญชี 5 รายการ + เมนูผู้ใช้บน Navbar — PR #63) — §2 = 27 หน้าเดิมของเฟส 4 · §2b = หน้าหลังร้านที่เพิ่มภายหลัง · §2c = หน้าร้าน `/customer/*` (ย้ายมาจาก FrontOffice — BACKLOG3/4) · **ข้อแก้ §2:** #22 Attendance ไม่มีในโค้ดแล้ว (ไม่มี `app/owner/attendance`) · #8 POS = `OrderInStore`
+
+---
+
+## 1. Checklist "หน้าถูก wire แล้ว"
+
+หน้าหนึ่งนับว่า **wired** เมื่อครบทุกข้อ:
+
+- [ ] มี folder + `page.tsx` ใต้ `src/app/…`
+- [ ] `page.tsx` บาง — แยก `<X>View.tsx` + `use<X>ViewModel.ts` ตาม `CODE_STRUCTURE.md` (ยกเว้นหน้าจิ๋วยุบไฟล์เดียวได้)
+- [ ] **เข้าถึงได้จริง**: มี leaf ใน `src/constants/menu.ts` **หรือ** ระบุ entry point อื่นชัดเจน (ปุ่ม, row action, navbar, redirect)
+- [ ] `resolveMenuKey()` (`src/constants/menuKeys.ts` → `ROUTE_MENU_MAP`) คืน menuKey ได้ตรงกับที่ตั้งใจ **หรือ** ระบุว่า login-only โดยตั้งใจ
+- [ ] ViewModel เรียก `usePermission(key)` ถ้าหน้ามี action create/update/delete/approve
+- [ ] มี key ใน `src/constants/breadcrumb.ts` → `ROUTE_NAV_KEY` (path ตรงตัว) — หรือระบุข้อยกเว้น (dynamic route)
+- [ ] มี namespace ใน `src/i18n/messages/{th,en}.json` ทั้งสองไฟล์ (`npm run lint:i18n` ผ่าน)
+- [ ] มีแถวใน `REBUILD_PLAN.md` §7 + ตาราง §2 ของเอกสารนี้ตรงกัน
+
+ใช้เช็คลิสต์นี้ **ทุกครั้งที่ปิดงาน 1 screen** ก่อน mark ✅
+
+---
+
+## 2. ตารางหลัก (27 หน้า)
+
+**Status:** ✅ เสร็จ · 🔄 กำลังทำ · ⬜ ยังไม่เริ่ม
+**Reach:** ทางเข้าจริงของหน้า (sidebar leaf ใน `menu.ts`, ปุ่ม/row action, navbar, redirect)
+
+| # | Screen | Route | Status | Reach | menuKey | Breadcrumb key | Template | Files | _components (page-local) | Vertical |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | Login | `/login` | ✅ | AuthLayout (public, ไม่ผ่าน sidebar) | N/A (auth) | — (AuthLayout ไม่มี breadcrumb) | AuthLayout | `page.tsx` + `_components/LoginForm.tsx` | LoginForm | auth (มีแล้ว) |
+| 2 | Dashboard | `/owner/dashboard` | ✅ | sidebar: `dashboard` leaf ใน `sectionOverview` (ไม่มี menuKey = login-only ตั้งใจ — **ปิด G1**) | — (login-only) | `dashboard` (crumb แรกเสมอ) | DashboardPageLayout | `page.tsx`+`DashboardView.tsx`+`useDashboardViewModel.ts` | RecentOrdersWidget, LowStockWidget, TopProductsWidget, ProductionStatusWidget | `reports.dashboard` (มีแล้ว) |
+| 3 | Products List | `/owner/products` | ✅ | sidebar: `products` leaf | `products` | `products` | ListPageLayout | `page.tsx`+`ProductsView.tsx`+`useProductsViewModel.ts` | ProductCard, ProductGrid, CategoryChip, RatingDisplay | `products` (มีแล้ว) — **reference หน้ารายการ** |
+| 4 | Add Product | `/owner/products/addProducts` | ✅ | ปุ่ม "เพิ่มสินค้า" บน Products List | `products` | `productsAdd` | (form) | `page.tsx`+`AddProductView.tsx`+`useAddProductViewModel.ts` | ProductFormFields (ใช้ร่วม edit) | `products` (มีแล้ว) — **reference หน้าฟอร์ม** |
+| 5 | Edit Product | `/owner/products/[id]/edit` | ✅ | row action บน Products List | `products` | ❌ ไม่มี key ให้ dynamic route (**G5**) — โชว์แค่ crumb "products" | (form) | `page.tsx`+`EditProductView.tsx`+`useEditProductViewModel.ts` | ProductFormFields | `products` (มีแล้ว) |
+| 6 | Product Stock | `/owner/products/productStock` | ✅ | sidebar: `productStock` leaf ใต้กลุ่ม `products` (**ปิด G2**) | `stock` | `productStock` | ListPageLayout | `page.tsx`+`ProductStockView.tsx`+`useProductStockViewModel.ts` | AdjustStockModal, StockProgressRow | reuse: `products`+`productCategories`+`units` (ไม่มี resource ใหม่) |
+| 7 | Manage Orders | `/owner/orders/manageOrders` | ✅ | sidebar: `ordersManage` leaf | `orders` | `ordersManage` | ListPageLayout | `page.tsx`+`ManageOrdersView.tsx`+`useManageOrdersViewModel.ts`+`orderStatus.ts` | OrderStatusFilter, PaymentSlipPreview, OrderLifecycleSteps, OrderDetailContent | `orders` (ใหม่ — DTO รวม ready+preorder) · `shared/feedback/DetailDrawer` (build) |
+| 8 | POS หน้าร้าน | `/owner/orders/OrderInStore` | ✅ | sidebar: `ordersInStore` leaf | `orders` | `ordersInStore` | custom 2-pane (`DashboardPageLayout` shell) | `page.tsx`+`POSView.tsx`+`usePOSViewModel.ts`+`posCart.ts` | ProductPickerGrid, CartPanel, QRPaymentModal | reuse: `orders`+`products` (ไม่มี resource ใหม่) · QR = mock (`qrcode` lib) |
+| 9 | Ingredients List | `/owner/ingredients` | ✅ | sidebar: `ingredients` leaf | `ingredients` | `ingredients` | ListPageLayout | `page.tsx`+`IngredientsView.tsx`+`useIngredientsViewModel.ts`+`ingredientStatus.ts` | IngredientFormModal | `ingredients`+`ingredient-categories` (ใหม่) · reuse `units` · `src/utils/unitContext.ts` (build) |
+| 10 | Ingredient Stock | `/owner/ingredients/ingredientStock` | ✅ | sidebar: `ingredientStock` leaf | `stock` | `ingredientStock` | ListPageLayout | `page.tsx`+`IngredientStockView.tsx`+`useIngredientStockViewModel.ts` | StockActionModal (โหมดเดียว รับเข้า/เบิกใช้/ปรับยอด) | `ingredient-transactions` (ใหม่) · reuse `ingredients`+`units`+`ingredientStatus.ts` |
+| 11 | Ingredient History | `/owner/ingredients/ingredientHistory` | ✅ | sidebar: `ingredientHistory` leaf | `stock` | `ingredientHistory` | ListPageLayout | `page.tsx`+`IngredientHistoryView.tsx`+`useIngredientHistoryViewModel.ts` | — (ตาราง + `INGREDIENT_TXN_CONFIG` tag) | reuse `ingredient-transactions`+`ingredients`+`units` · **ตัด AnalyticsBarChart (charts family defer)** |
+| 12 | Manage Units | `/owner/ingredients/units` | ✅ | sidebar: `units` leaf | `ingredients` | `units` | 2-col (`DashboardPageLayout` shell) | `page.tsx`+`UnitsView.tsx`+`useUnitsViewModel.ts` | UnitListCard, UnitFormModal | reuse: `units` (ไม่มี resource ใหม่) · `src/utils/unitContext.ts` |
+| 13 | Production — Plan | `/owner/production?tab=plan` | ✅ | sidebar: `production` leaf (route เดียว, สลับผ่าน `?tab=`) | `production` | `production` | TabbedPageLayout | `page.tsx`+`ProductionView.tsx`+`useProductionViewModel.ts`+`productionStatus.ts` | PlanTab, ProductionOrderFormModal | `production-orders` (ใหม่ — DTO เดียวฝัง `items[]`) |
+| 14 | Production — Status | `/owner/production?tab=status` | ✅ | เหมือน #13 | `production` | `production` | TabbedPageLayout | (ใช้ไฟล์ชุดเดียวกับ #13) | StatusTab, StatusBoard, ProductionOrderCard | reuse `production-orders` (ไม่มี resource ใหม่) — kanban drag-drop เนทีฟ |
+| 15 | Production — History | `/owner/production?tab=history` | ✅ | เหมือน #13 | `production` | `production` | TabbedPageLayout | (ใช้ไฟล์ชุดเดียวกับ #13) | HistoryTab, BreakdownList | reuse `production-orders` (ไม่มี resource ใหม่) — **ตัด AnalyticsBarChart/RevenueBarChart (charts family defer เหมือน #11)** |
+| 16 | Recipes | `/owner/recipes` | ✅ | sidebar: `recipes` leaf | `recipes` | `recipes` | TabbedPageLayout (2 tab) | `page.tsx`+`RecipesView.tsx`+`useRecipesViewModel.ts`+`recipeForm.ts`+`componentForm.ts` | RecipeCard, RecipeDetail, MainRecipeModal, ComponentFormModal, IngredientEditor, StepEditor | `recipes`+`components` (ใหม่ — DTO denormalize) · หมวดหมู่สูตรส่วนประกอบ = fixed enum (ไม่ใช่ resource แยก) |
+| 17 | Employees List | `/owner/employees` | ✅ | sidebar: `employees` leaf | `employees` | `employees` | ListPageLayout | `page.tsx`+`EmployeesView.tsx`+`useEmployeesViewModel.ts` | — (component กลางล้วน) | `users`+`roles` (ใหม่) · reuse DataTable/StatCard/Avatar/ConfirmDeletePopup |
+| 18 | Add Employee | `/owner/employees/addEmployee` | ✅ | ปุ่ม "เพิ่มพนักงาน" บน Employees List (gate `perm.create`) | `employees` | `employeesAdd` | (form) | `page.tsx`+`AddEmployeeView.tsx`+`useAddEmployeeViewModel.ts` | EmployeeFormFields (ใช้ร่วม edit) | reuse: `users`+`roles` (มีแล้ว) · `employeeForm.ts` (pure: empty/fromUser/toInput, dayjs↔ISO) |
+| 19 | Edit Employee | `/owner/employees/editEmployee` | ✅ | row action "แก้ไข" บน Employees List (`?id=` query, ไม่ใช่ dynamic segment → breadcrumb match ได้) | `employees` | `employeesEdit` | (form) | `page.tsx` (Suspense)+`EditEmployeeView.tsx`+`useEditEmployeeViewModel.ts` | EmployeeFormFields | reuse: `users`+`roles` (มีแล้ว) |
+| 20 | Permissions Mgmt | `/owner/employees/permissions` | ✅ | sidebar: `permissions` leaf | `employees` | `permissions` | 2-pane (`DashboardPageLayout` shell) | `page.tsx`+`PermissionsView.tsx`+`usePermissionsViewModel.ts`+`permissionGroups.ts` | RoleListPanel, PermissionMatrix (antd Collapse+Checkbox), RoleFormModal | `permissions` (ใหม่) · `roles` ขยาย (+create/remove, `RoleInput`) · reuse `users` · gate `usePermission("employees").{create,update,delete}` |
+| 21 | User Activity Log | `/owner/employees/userLog` | ✅ | sidebar: `userLog` leaf | `employees` | `userLog` | ListPageLayout | `page.tsx`+`UserLogView.tsx`+`useUserLogViewModel.ts` | LogDetailContent (ใน `DetailDrawer`) | `user-logs` (ใหม่ — อ่านอย่างเดียว) · reuse `users`+`roles` · `USER_LOG_ACTION_CONFIG` (enumConfig) · **แท็บประวัติสต็อกของ #6 ยัง defer** (ต้องเติมแท็บที่หน้า #6 กรอง `entity=Products`) |
+| 22 | Attendance | `/owner/attendance` | ✅ | sidebar: `attendance` leaf ใน `sectionEmployees` (ไม่มี menuKey = login-only ตั้งใจ — **ปิด G3**) | — (login-only, ระบุในคอมเมนต์ `menuKeys.ts`) | `attendance` | custom (`DashboardPageLayout` shell) | `page.tsx`+`AttendanceView.tsx`+`useAttendanceViewModel.ts` | ClockCard (นาฬิกาสด + ปุ่มเช็คอิน/เอาท์), AttendanceHistoryTable | `attendances` (ใหม่) · endpoint พิเศษ `/attendances/{today,check-in,check-out}` (custom handler ไม่ใช้ crudHandlers) · `ATTENDANCE_STATUS_CONFIG` (enumConfig, key ไทย) · reuse `useCurrentUser` |
+| 23 | Finance — Expenses | `/owner/finance/expenses` | ✅ | sidebar: `financeExpenses` leaf | `reports` | `financeExpenses` | ListPageLayout | `page.tsx`+`FinanceExpensesView.tsx`+`useFinanceExpensesViewModel.ts`+`expenseForm.ts` | ExpenseFormModal, RecurringRemindersList | `expenses` (ใหม่) · reuse `orders` (โชว์รายรับคู่เทียบ) |
+| 24 | Finance — P&L | `/owner/finance/summary` | ✅ | sidebar: `financeSummary` leaf | `reports` | `financeSummary` | DashboardPageLayout | `page.tsx`+`FinanceSummaryView.tsx`+`useFinanceSummaryViewModel.ts`+`financePeriod.ts` | PLStatementTable | reuse `orders`+`expenses` (ไม่มี resource ใหม่) |
+| 25 | Store Design | `/owner/store-design` | ✅ | sidebar: `storeDesign` leaf (ไม่มี menuKey) | — (login-only) | `storeDesign` | ListPageLayout | `page.tsx`+`StoreDesignView.tsx`+`useStoreDesignViewModel.ts`+`bannerForm.ts` | BannerCard, BannerFormModal | `banners` (ใหม่ — CRUD) · reuse `UploadImageBox` + `TypeTabBar` · `BANNER_STATUS_CONFIG` (enumConfig) · สถานะ `scheduled` derive จาก `start_date` |
+| 26 | Notification History | `/owner/notificationsHistory` | ✅ | navbar: ลิงก์ "ดูทั้งหมด" ใน NotificationDropdown (ตั้งใจไม่มีใน sidebar — **G7**) | — (login-only) | `notificationsHistory` | ListPageLayout | `page.tsx`+`NotificationHistoryView.tsx`+`useNotificationHistoryViewModel.ts` | NotificationDetailContent (ใน `DetailDrawer` reuse) | reuse: `notifications` (มีแล้ว — เพิ่ม `remove` ใน service, fixture 5→13) |
+| 27 | Access Denied | `/owner/access-denied` | ✅ | redirect ตอนถูกปฏิเสธสิทธิ์ (proxy/permission gate) — ตั้งใจไม่มีใน sidebar (**G7**) | N/A (หน้าปฏิเสธสิทธิ์ ไม่ควร gate ตัวเอง) | ❌ ไม่มี key (**G5**) — โชว์แค่ crumb "หน้าหลัก" | (none) | `page.tsx`+`_components/AccessDeniedCard.tsx` | AccessDeniedCard | ไม่มี resource — i18n `accessDenied.*` |
+
+*(Production #13–15 ใช้ route เดียวกัน สลับด้วย `?tab=` — ไม่ใช่ 3 route แยก)*
+
+## 2b. หลังร้าน — หน้าที่เพิ่มหลังเฟส 4
+
+| # | Screen | Route | Reach | menuKey | Breadcrumb key | Files | หมายเหตุ |
+|---|---|---|---|---|---|---|---|
+| 28 | รอบพรีออเดอร์ | `/owner/orders/preOrderRound` | sidebar ใต้คำสั่งซื้อ | `preorder` | `ordersPreorderRound` | MVVM + `_components/` (RoundsTab · DashboardTab · OrdersTab · RoundFormModal · RoundDashboardDrawer ...) | 3 แท็บ `?tab=rounds\|dashboard\|orders` — รอบ · **สรุปรอบ** (F4 — `useRoundDashboardViewModel` แยก) · พรีออเดอร์ของลูกค้า |
+| 29 | คูปอง | `/owner/promotions/coupons` | sidebar ใต้โปรโมชัน | `promotions` | `promotionsCoupons` | MVVM + CouponCard · CouponFormModal | แต้มแลกคูปอง (`points_cost`) |
+| 30 | ตั้งราคา/ราคาลด | `/owner/promotions/pricing` | sidebar ใต้โปรโมชัน | `products` (ยิง /admin/products) | `promotionsPricing` | MVVM | |
+| 31 | รายงานยอดขาย | `/owner/reports/sales` | sidebar ใต้รายงาน | `reports` | `reportsSales` | MVVM | |
+| 32 | รีวิวลูกค้า | `/owner/reports/reviews` | sidebar ใต้รายงาน | `reports` | `reportsReviews` | MVVM + ReviewCard · ReviewFiltersBar · ReplyBox · NoteBox · ReviewDetailContent | E4 — กรอง/แบ่งหน้าที่ server + summary |
+| 33 | ตั้งค่าหัวข้อรีวิว | `/owner/reports/reviews/settings` | ปุ่ม "ตั้งค่าหัวข้อรีวิว" บนหน้ารีวิว (ไม่มี sidebar leaf — ตั้งใจ) | `reports` | `reviewSettings` | MVVM + AspectsTab · TermsTab | E4 |
+| 34 | คำพ้องค้นหา | `/owner/products/search-synonyms` | sidebar ใต้สินค้า | `products` | `searchSynonyms` | MVVM + SynonymGroupForm · SearchTester | E3 |
+| 35 | ข้อมูลร้าน | `/owner/store-info` | sidebar กลุ่มพนักงาน | `store_info` (ส่วนอื่น owner เท่านั้น) | `storeInfo` | MVVM + SectionCard · StoreAddressFields · CoordinateInput · WeeklyMarketsEditor · TimeSelect | E2 — พนักงานเห็นเฉพาะหน้าร้านประจำสัปดาห์ |
+| 36 | โซนค่าจัดส่ง (หลังร้าน/POS) | `/owner/orders/delivery-zones` | sidebar ใต้คำสั่งซื้อ | `orders` | `deliveryZones` | MVVM + DeliveryZoneForm · ZoneChecker · `deliveryZoneForm.ts` | I8 — `DeliveryZones` · เพิ่ม/แก้/ลบ/กู้คืน |
+| 37 | ค่าจัดส่งหน้าร้านออนไลน์ | `/owner/shipping` | sidebar กลุ่มพนักงาน (ต่อจากข้อมูลร้าน) | `store_info` (view / update) | `webShipping` | MVVM + ShippingZoneFormFields · `shippingZoneForm.ts` | F2 — `ShippingZones` A–D (backend #74) · โซนคงที่ แก้ได้อย่างเดียว |
+| — | โปรไฟล์ | `/profile` | เมนูผู้ใช้บน Navbar | — (login-only) | — | MVVM | เชื่อม LINE · ซ่อนอีเมลชั่วคราวของบัญชี LINE (I10) |
+| — | สมัครสมาชิก · LINE login | `/register` · `/login/line` | ลิงก์จากหน้า login | — (public) | — | | B1/B3 |
+
+## 2c. หน้าร้าน `/customer/*`
+
+> เขียนแบบหน้าเดียวไฟล์เดียว (ยกจาก FrontOffice) · ข้อความไทยในโค้ด (ยกเว้นจาก `lint:i18n`) · layout = `CustomerChrome` (Navbar + Footer) · guest เปิดได้ทุกหน้า หน้าที่ต้อง login ครอบด้วย `CustomerAuthGate` (🔒)
+> ทางเข้า: Navbar (หน้าแรก · สินค้าทั้งหมด · พรีออเดอร์ · ติดต่อเรา · ตะกร้า · กระดิ่ง · **เมนูผู้ใช้**: บัญชีของฉัน · คำสั่งซื้อของฉัน · สมาชิกของฉัน · รายการโปรด) · Footer (สินค้า · การจัดส่ง · ติดต่อเรา) · **เมนูบัญชี** `AccountSideMenu` (5 รายการ: ข้อมูลของฉัน · ที่อยู่ · เปลี่ยนรหัสผ่าน · ประวัติการสั่งซื้อ · ประวัติพรีออเดอร์) · ลิงก์ในแจ้งเตือน/LINE/อีเมล
+
+| Screen | Route | Reach | API หลัก | งาน |
+|---|---|---|---|---|
+| หน้าแรก | `/customer` (`/` เด้งมา) | Navbar/โลโก้ | /catalog/products · banners · products/recommended · (/shop/recommendations) | สินค้าแนะนำ C2 |
+| สินค้าทั้งหมด | `/customer/product` | Navbar · Footer | /catalog/products?search= (ขยายคำพ้องที่ server) | U4 |
+| รายละเอียดสินค้า | `/customer/product/[id]` (`?round=` = สั่งในรอบพรีออเดอร์) | บัตรสินค้า | /catalog/products/:id (+customization · reviews · similar · sentiment) | C1 |
+| ตะกร้า 🔒 | `/customer/cart` | Navbar | /shop/cart | |
+| ชำระเงิน 🔒 | `/customer/checkout` | ตะกร้า | /shop/orders · delivery-quote · coupons · points · pickup-locations | C3 |
+| รอบพรีออเดอร์ | `/customer/preorder` · `/customer/preorder/[roundId]` | Navbar | /catalog/preorder-rounds | D3 |
+| ชำระพรีออเดอร์ 🔒 | `/customer/preorder/checkout` | รายการพรีออเดอร์ | /shop/preorders | D3 |
+| ติดต่อเรา | `/customer/contact-us` | Navbar · Footer | /catalog/store-info · contact-topics · /shop/contact | D8 |
+| การจัดส่ง | `/customer/shipping` | Footer | /catalog/shipping-zones · store-info · categories · pickup-locations | D9 |
+| บัญชีของฉัน 🔒 | `/customer/account` | เมนูบัญชี ("ข้อมูลของฉัน") · เมนูผู้ใช้ | /shop/me (+ email · line) | B2 |
+| ที่อยู่ 🔒 | `/customer/account/address` | เมนูบัญชี | /shop/addresses | D2 |
+| ประวัติการสั่งซื้อ 🔒 | `/customer/account/purchases` · `/[id]` (ชำระเงิน/สลิป/ยกเลิก) | เมนูบัญชี · เมนูผู้ใช้ · แจ้งเตือน | /shop/orders · /shop/payments | D1 · C4 |
+| เขียนรีวิว 🔒 | `/customer/account/purchases/[id]/review` · `/customer/account/preorders/[id]/review` | ปุ่ม "รีวิวสินค้า" (completed + ชำระแล้ว) | /shop/reviews (+upload) · /catalog/review-aspects | D7 |
+| ประวัติพรีออเดอร์ 🔒 | `/customer/account/preorders` · `/[id]` | เมนูบัญชี · แจ้งเตือน | /shop/preorders | D3 |
+| สมาชิก/แต้ม/คูปอง 🔒 | `/customer/account/member` | เมนูผู้ใช้ | /shop/points · /shop/coupons | D4 |
+| รายการโปรด 🔒 | `/customer/account/favorites` | เมนูผู้ใช้ · หัวใจบนบัตร | /shop/favorites | D5 |
+| การแจ้งเตือน 🔒 | `/customer/account/notifications` | กระดิ่ง | /shop/notifications | D6 |
+| เปลี่ยนรหัสผ่าน 🔒 | `/customer/changepassword` | เมนูบัญชี | /shop/me/password | B2 |
+| ยืนยันอีเมล · ลืม/ตั้งรหัสใหม่ | `/customer/verify-email` · `/customer/forgot-password` · `/customer/reset-password` | ลิงก์ในอีเมล · หน้า login | /auth/* | B1 |
+| (ลิงก์เก่า) | `/customer/order/[id]` | — | redirect → `/customer/account/purchases/[id]` | D1 |
+
+---
+
+## 3. ช่องโหว่ wiring ที่พบ (as of 2026-09-01, ปิดแล้วส่วนใหญ่ — ดูวันที่ต่อรายการ)
+
+> G1/G2/G3 ปิดหมดแล้ว (เฟส 5 — 2026-09-07) · เหลือ G4/G6/G7 ที่ตั้งใจปล่อยไว้ตามเดิม (นอกสโคป/ไม่ใช่ gap จริง)
+
+- ~~**G1 — Dashboard (#2) ไม่มี sidebar leaf**~~ **ปิดแล้ว (2026-09-07)** — เพิ่ม `dashboard` leaf เป็น item แรกใน `sectionOverview` (`menu.ts`, icon `HomeIcon`) **ไม่ใส่ menuKey** = login-only ตั้งใจ
+- ~~**G2 — Product Stock (#6) ไม่มี sidebar leaf**~~ **ปิดแล้ว (2026-09-07)** — เปลี่ยน node `products` จาก flat item เป็น group มี children (`products` list + `productStock`, icon `ArchiveBoxIcon`, `menuKey: "stock"`)
+- ~~**G3 — Attendance (#22) ไม่มี sidebar leaf และไม่มี menuKey mapping**~~ **ปิดแล้ว (2026-09-02)** — เพิ่ม `attendance` leaf ใน `sectionEmployees` (`menu.ts`, icon `ClockIcon`) โดย **ไม่ใส่ menuKey** = login-only ตั้งใจ (พนักงานทุกคนเช็คเวลาตัวเองได้) · เพิ่ม `attendance` ในคอมเมนต์ login-only ของ `menuKeys.ts`
+- **G4 — sidebar มีลิงก์ชี้ไปหน้านอกสโคป 27 หน้า** — `reportsSales`, `reportsReviews` (ใต้ node "reports"), `promotionsPricing`, `promotionsCoupons` (ใต้ node "promotions") กดแล้ว **404 อยู่ตอนนี้** เพราะเป็น "Sales/Reviews report" และ "Promotions" ที่ระบุไว้ใน `REBUILD_PLAN.md` ว่า "นอก 27 screen — เฟสหลัง" → **ตัดสินใจ: ปล่อยไว้ตามเดิม** ไม่ซ่อน ไม่ disable
+- **G5 — Breadcrumb ไม่มี key ให้ 2 route:** Edit Product (#5, dynamic `[id]`), Access Denied (#27) — `buildBreadcrumbs()` match path ตรงตัวเท่านั้น ไม่รองรับ dynamic segment จึงโชว์แค่ crumb ของหน้า parent
+  *ปิดแล้ว:* Add Employee (#18) → `nav.employeesAdd` · Edit Employee (#19) → `nav.employeesEdit` — ทั้งคู่เป็น static path (`?id=` เป็น query ไม่ใช่ segment) จึง match `ROUTE_NAV_KEY` ได้ตรง ๆ
+- **G6 — `payments` menuKey ไม่มี "หน้า" ใน 27 หน้าใช้เป็น route/menu** — แต่ตั้งแต่ #7 Manage Orders ใช้เป็น **permission ระดับ action** แล้ว (`usePermission("payments").approve` กันปุ่ม "ยืนยันการชำระเงิน" ใน DetailDrawer) — ไม่ใช่ gap อีกต่อไป แค่ไม่มี route ของตัวเองตามที่ตั้งใจไว้แต่แรก (หน้า "Payments" อยู่นอกสโคป 27)
+- **G7 — Notification History (#26) / Access Denied (#27) ตั้งใจไม่มีใน sidebar** — ทางเข้า: #26 ผ่านลิงก์ "ดูทั้งหมด" ใน `NotificationDropdown` (navbar) · #27 ผ่าน redirect เมื่อ proxy/permission gate ปฏิเสธ — ไม่ใช่ gap ต้องแก้ แค่บันทึกไว้ให้ checklist §1 ผ่านข้อ "เข้าถึงได้"
+
+---
+
+## 4. Build checklist ต่อ vertical (21 หน้าที่เหลือ) — ใช้เป็นไกด์ลำดับทำเฟส 4
+
+รูปแบบ copy จาก reference ที่มีอยู่แล้ว: **list → Products (#3)** · **form → Add Product (#4)** · **dashboard aggregate → Dashboard (#2)** · **reuse-only list → Product Stock (#6)**
+
+| Vertical | Screens | Resource ใหม่ (type/service/fixture/handler) | Shared component ที่ต้อง build/promote | i18n namespace ที่ต้องเติม |
+|---|---|---|---|---|
+| **orders** | #7 ✅ Manage Orders, #8 ✅ POS | `orders` ✅ (DTO เดียว รวม ready+preorder — ไม่แยก order-items/payments collection แบบต้นทาง) | `DetailDrawer` ✅ (build, ใช้กับ #7) · #7 page-local: OrderStatusFilter, PaymentSlipPreview, OrderLifecycleSteps, OrderDetailContent · #8 page-local: ProductPickerGrid, CartPanel, QRPaymentModal (+ `posCart.ts` pure) — **QR = mock ด้วย lib `qrcode`** ไม่ใช่ Omise จริง | `orders` ✅ · `pos` ✅ (th+en) |
+| **ingredients** | #9 ✅ #10 ✅ #11 ✅ #12 ✅ — **vertical ครบ** | `ingredients` ✅ · `ingredient-categories` ✅ · `ingredient-transactions` ✅ · `units` · `src/utils/unitContext.ts` ✅ | IngredientFormModal ✅ · UnitListCard/UnitFormModal ✅ · StockActionModal ✅ · **ตัดออก: BulkReceive, AutoCompleteSearch, AnalyticsBarChart, lot/expiry** | `ingredients`·`units`·`ingredientStock`·`ingredientHistory` ✅ (th+en) |
+| **production** | #13 ✅ Plan, #14 ✅ Status, #15 ✅ History — **vertical ครบ** | `production-orders` ✅ (DTO เดียว — ไม่แยก production-items, ยังไม่ผูก `recipes` เพราะ #16 ยังไม่ทำ) | `TabbedPageLayout` ✅ (build, ค้างจากเฟส 3) · PlanTab/StatusTab/HistoryTab (page-local) · StatusBoard+ProductionOrderCard (kanban) · ProductionOrderFormModal · ProductionOrderDetail (ใน `DetailDrawer` reuse) · BreakdownList (แท่ง % แทน RevenueBarChart/AnalyticsBarChart — charts family ยังไม่ทำ) | `production.*` ✅ (th+en) |
+| **recipes** | #16 ✅ Recipes — **vertical ครบ** | `recipes` ✅ (สูตรหลัก) · `components` ✅ (สูตรส่วนประกอบ — หมวดหมู่ fixed enum ไม่ใช่ resource แยก) | `TabbedPageLayout` ✅ (reuse จาก Production) · RecipeCard, RecipeDetail, MainRecipeModal, ComponentFormModal ✅ · IngredientEditor/StepEditor ✅ (ใช้ร่วม 2 modal) · `DetailDrawer` (reuse) | `recipes.*` ✅ (th+en) |
+| **employees/roles** | #17 ✅ List · #18 ✅ Add · #19 ✅ Edit · #20 ✅ Permissions · #21 ✅ User Log — **vertical ครบ** | `users` ✅ + `roles` ✅ (+create/remove) · `permissions` ✅ · `user-logs` ✅ | #17 ไม่มี _components · #18/#19: `EmployeeFormFields`+`employeeForm.ts` · #20: RoleListPanel, PermissionMatrix, RoleFormModal (+`permissionGroups.ts` pure) · #21: LogDetailContent (ใน `DetailDrawer` reuse) — **ตัดออก:** AvatarUploader/ToggleRow/PasswordShuffleButton/MetaChips/DangerZone, `computeFieldDiff` util port (mock ส่ง changes[] เป็น string มาแล้ว), AnalyticsBarChart | `employees` ✅ · `permissions` ✅ · `userLog` ✅ · `enums.{userLogAction,menuKey}` ✅ · `common.export` ✅ (th+en) |
+| **attendance** | #22 ✅ Attendance | `attendances` ✅ (+ custom handler `/attendances/{today,check-in,check-out}`) | ClockCard, AttendanceHistoryTable · `ATTENDANCE_STATUS_CONFIG` (enumConfig) · reuse `useCurrentUser`/`DataTable` | `attendance.*` (th+en) |
+| **finance** | #23 ✅ Expenses, #24 ✅ P&L — **vertical ครบ** | `expenses` ✅ (category/payment_method = fixed enum) — ไม่มี `/reports/finance-summary` แยก (ประกอบสดใน ViewModel จาก `orders`+`expenses`) | ExpenseFormModal, RecurringRemindersList ✅ · `BreakdownList` ✅ (promote ไป `shared/stats/`) · PLStatementTable ✅ · `TypeTabBar` (reuse — period selector) | `finance.*` ✅ (th+en) |
+| **store-design** | #25 ✅ Store Design | `banners` ✅ (CRUD) | BannerCard, BannerFormModal · `UploadImageBox`+`TypeTabBar` (reuse) · `bannerForm.ts` (pure — `getBannerStatus`/`fromBanner`/`toInput`, dayjs↔ISO) — **ตัดออก:** BannerGrid (grid inline), duplicate action, preview modal | `storeDesign.*` + `enums.bannerStatus.*` (th+en) |
+| **notifications history** | #26 ✅ Notification History | reuse: `notifications` (มีแล้ว — เพิ่ม `remove`) | `DetailDrawer` (reuse) · `TypeTabBar` (reuse) · `_components/NotificationDetailContent` | `notifications.*` ขยาย (th+en) |
+| **access-denied** | #27 ✅ Access Denied | ไม่มี | `_components/AccessDeniedCard` (page บาง → render card) | `accessDenied.*` (th+en) |
+
+---
+
+## 5. การดูแลเอกสารนี้
+
+ทุกครั้งที่ปิดงาน 1 screen:
+1. พลิก Status ในตาราง §2 ที่นี่ **และ** ใน `REBUILD_PLAN.md` §7 ให้ตรงกัน
+2. ถ้าเพิ่ม sidebar leaf / breadcrumb key / i18n namespace ใหม่ → อัปเดตคอลัมน์ Reach/Breadcrumb ในแถวนั้น
+3. รัน `npm run check` (i18n + theme + tsc + eslint)
+4. ถ้ามี component ถูก promote จาก page-local → `shared/` → อัปเดต `COMPONENT_MAP.md`
+5. ถ้าปิดช่องโหว่ใน §3 ได้ (เช่น เพิ่ม leaf ให้ Dashboard/Product Stock/Attendance) → ลบรายการนั้นออกจาก §3 พร้อมโน้ตว่าทำอะไรไป

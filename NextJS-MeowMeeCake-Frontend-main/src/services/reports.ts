@@ -1,0 +1,227 @@
+// ─────────────────────────────────────────────────────────────
+// src/services/reports.ts
+// ไม่มี endpoint /reports/dashboard เดียวจบ — backend แยกเป็นหลาย endpoint (dashboard/*, ingredients/
+// low-stock, orders, production-orders) ประกอบ DashboardSummary ที่นี่จุดเดียว (ViewModel ไม่ต้องรู้)
+//
+// items_summary ("บราวนี่ ×2, เค้กอัลมอนด์ ×1"): ออเดอร์ล่าสุดขอ ?with_items=true · ใบสั่งผลิต backend แนบ items[] มาในรายการเสมอ
+// (ทั้งคู่เป็น query เดียวฝั่ง backend ไม่ใช่ N+1 — เดิมปล่อยว่างจนคอลัมน์ "รายการ" ว่างทุกแถว TC-ADM-12)
+// ─────────────────────────────────────────────────────────────
+import { http, type HttpReader } from "@/lib/http";
+import { unitLabel } from "@/utils/unitContext";
+import type {
+  DashboardSummary,
+  DashboardLowStock,
+  DashboardRecentOrder,
+  DashboardTopProduct,
+  DashboardProduction,
+} from "@/types/dashboard";
+
+// ── shape ดิบเฉพาะจุดที่ dashboard ใช้ (ไม่ผ่าน Order/ProductionOrder DTO ที่ยังไม่ตรง backend) ──
+interface RawOverview {
+  orders: { total: number; by_status: Record<string, number>; paid: number };
+  revenue: number;
+  low_stock: { products: number; ingredients: number };
+}
+interface RawLowStockIngredient {
+  _id: string;
+  ingredient_name: string;
+  current_stock: number;
+  reorder_point: number;
+  unit_id?: { unit_abbr?: string; unit_name?: string } | string | null;
+}
+interface RawTopProductsResult {
+  items: { product_id: string; product_name_th: string; quantity_sold: number; revenue: number }[];
+}
+interface RawOrder {
+  _id: string;
+  order_no: string;
+  total_amount: number;
+  order_status: string;
+  user_id?: { user_fullname?: string } | string | null;
+  items?: { product_snapshot?: { product_name_th?: string }; quantity: number }[];
+}
+interface RawProductionOrder {
+  _id: string;
+  production_no: string;
+  production_status: string;
+  production_date: string;
+  items?: { product_id?: { product_name_th?: string } | string | null; planned_qty: number; item_status?: string }[];
+}
+
+/** "บราวนี่ ×2, เค้กอัลมอนด์ ×1" — ข้ามแถวที่ไม่มีชื่อ */
+function summarize(lines: { name?: string; qty: number }[]): string {
+  return lines.filter((l) => l.name).map((l) => `${l.name} ×${l.qty}`).join(", ");
+}
+
+/** ช่วงเวลา "วันนี้" ตามเวลาไทย (UTC+7 คงที่ ไม่มี DST) แปลงเป็นขอบเขต UTC ให้ query created_at ได้ */
+function bangkokTodayRangeUtc(): { date_from: string; date_to: string } {
+  const OFFSET_MS = 7 * 60 * 60 * 1000;
+  const bkkNow = new Date(Date.now() + OFFSET_MS);
+  const y = bkkNow.getUTCFullYear();
+  const m = bkkNow.getUTCMonth();
+  const d = bkkNow.getUTCDate();
+  const startUtcMs = Date.UTC(y, m, d, 0, 0, 0, 0) - OFFSET_MS;
+  const endUtcMs = Date.UTC(y, m, d, 23, 59, 59, 999) - OFFSET_MS;
+  return { date_from: new Date(startUtcMs).toISOString(), date_to: new Date(endUtcMs).toISOString() };
+}
+
+function unitAbbrOf(unit: RawLowStockIngredient["unit_id"]): string {
+  if (!unit || typeof unit === "string") return "";
+  return unitLabel(unit);
+}
+
+function customerNameOf(user: RawOrder["user_id"]): string {
+  if (!user || typeof user === "string") return "-";
+  return user.user_fullname || "-";
+}
+
+export interface TopProductRow {
+  product_id: string;
+  product_name: string;
+  quantity_sold: number;
+  revenue: number;
+}
+
+export type RevenueChannel = "web" | "pos" | "preorder" | "other";
+
+/** GET /admin/dashboard/revenue-by-channel — รายรับ (ชำระแล้ว · ช่วงวันที่ตาม created_at) แยกตามช่องทางของ
+ *  "ออเดอร์" เป็นบาท (backend #52 — เลิกแยกตามประเภทสินค้าแล้ว) · ใช้ total_amount ทั้งก้อน ไม่กระจายสัดส่วน
+ *  web = ORD- (เว็บไซต์) · pos = POS- (หน้าร้าน) · preorder = PRE- (นับจาก collection พรีออเดอร์ด้วย)
+ *  · other = ออเดอร์เลขรุ่นเก่าก่อนแยก prefix (ระบุช่องทางย้อนหลังไม่ได้) */
+export interface RevenueByChannel extends Record<RevenueChannel, number> {
+  total: number;
+  counts: Record<RevenueChannel, number>;
+  /** จำนวนออเดอร์ + พรีออเดอร์ที่ชำระแล้วในช่วงนี้ */
+  orders: number;
+  /** ต้นทุนตามสูตรของสินค้าที่ขายได้ (Σ cost_per_unit × จำนวน) — backend รุ่นเก่ายังไม่ส่ง */
+  recipe_cogs?: number;
+}
+
+/** GET /admin/dashboard/sales-by-day — ยอดขายรายวัน (ชำระแล้ว · ไม่นับที่ยกเลิก · ออเดอร์ + พรีออเดอร์ รวมกัน)
+ *  วันที่ตามเวลาไทย · วันที่ไม่มียอด backend ไม่ส่งมา (เติม 0 เอง — dashboard/salesTrend.ts) */
+export interface SalesByDay {
+  from: string;
+  to: string;
+  /** channels = ยอดของวันนั้นแยกตามช่องทาง (กติกาเดียวกับ revenue-by-channel) — backend รุ่นเก่ายังไม่ส่ง */
+  series: { date: string; revenue: number; orders: number; channels?: Record<RevenueChannel, { revenue: number; orders: number }> }[];
+}
+
+export const reportsService = {
+  /** days = ย้อนหลังกี่วันนับจากตอนนี้ (backend clamp 1–180 · ตัดเป็นช่วง now − days×24 ชม.) — สิทธิ์ dashboard.view */
+  salesByDay: async (days: number, h: HttpReader = http): Promise<SalesByDay> =>
+    (await h.get<{ data: SalesByDay }>("/admin/dashboard/sales-by-day", { params: { days } })).data,
+
+  revenueByChannel: async (
+    params: { date_from?: string; date_to?: string } = {},
+    h: HttpReader = http,
+  ): Promise<RevenueByChannel> => {
+    const res = await h.get<{ data: RevenueByChannel }>("/admin/dashboard/revenue-by-channel", { params });
+    return res.data;
+  },
+
+  /** GET /admin/dashboard/top-products — จัดอันดับตาม quantity_sold เสมอ (backend เรียงให้แบบนี้
+   *  เท่านั้น ไม่มีพารามิเตอร์ sort อื่น) จำกัดสูงสุด 50 รายการ (backend clamp) */
+  topProducts: async (
+    params: { limit?: number; date_from?: string; date_to?: string } = {},
+    h: HttpReader = http,
+  ): Promise<TopProductRow[]> => {
+    const res = await h.get<{ data: RawTopProductsResult }>("/admin/dashboard/top-products", { params });
+    return res.data.items.map((p) => ({
+      product_id: p.product_id,
+      product_name: p.product_name_th,
+      quantity_sold: p.quantity_sold,
+      revenue: p.revenue,
+    }));
+  },
+
+  /**
+   * scope = widget ที่ผู้ใช้มีสิทธิ์ดู — ไม่มีสิทธิ์ = ไม่ยิง (คืนรายการว่าง) แทนที่ 403 ตัวเดียวจะทำให้ Promise.all ล้มทั้งหน้า
+   * overview / top-products ใช้ dashboard.view (หน้านี้กั้นไว้แล้ว) · ออเดอร์ล่าสุด = orders · วัตถุดิบใกล้หมด = ingredients ·
+   * สถานะการผลิต = production (Final-Backlog P11)
+   */
+  /** h = http client (ค่าเริ่มต้น http ปกติ) — ฝั่ง server ส่ง withConfig(cookie + no-store) เข้ามา (dashboard/page.tsx) */
+  dashboard: async (
+    scope: { orders: boolean; ingredients: boolean; production: boolean },
+    h: HttpReader = http,
+  ): Promise<{ data: DashboardSummary }> => {
+    const today = bangkokTodayRangeUtc();
+
+    const [overviewToday, overviewAllTime, lowStockRes, topProductsRes, recentOrdersRes, productionRes] =
+      await Promise.all([
+        h.get<{ data: RawOverview }>("/admin/dashboard/overview", { params: today }),
+        h.get<{ data: RawOverview }>("/admin/dashboard/overview"),
+        scope.ingredients
+          ? h.get<{ data: { count: number; items: RawLowStockIngredient[] } }>(
+              "/admin/ingredients/low-stock",
+              { params: { limit: 10 } }
+            )
+          : { data: { count: 0, items: [] as RawLowStockIngredient[] } },
+        h.get<{ data: RawTopProductsResult }>("/admin/dashboard/top-products", {
+          params: { limit: 5 },
+        }),
+        scope.orders ? h.getList<RawOrder>("/admin/orders", { params: { limit: 5, with_items: true } }) : { data: [] as RawOrder[] },
+        scope.production
+          ? h.getList<RawProductionOrder>("/admin/production-orders", { params: { limit: 20 } })
+          : { data: [] as RawProductionOrder[] },
+      ]);
+
+    const lowStock: DashboardLowStock[] = lowStockRes.data.items.map((i) => ({
+      _id: i._id,
+      ingredient_name: i.ingredient_name,
+      remaining: i.current_stock,
+      reorder_point: i.reorder_point,
+      unit_abbr: unitAbbrOf(i.unit_id),
+    }));
+
+    const topRows = topProductsRes.data.items;
+    const maxQty = topRows[0]?.quantity_sold || 1;
+    const topProducts: DashboardTopProduct[] = topRows.map((p) => ({
+      _id: p.product_id,
+      product_name: p.product_name_th,
+      sold_qty: p.quantity_sold,
+      revenue: p.revenue,
+      percent: Math.round((p.quantity_sold / maxQty) * 100),
+    }));
+
+    const recentOrders: DashboardRecentOrder[] = recentOrdersRes.data.map((o) => ({
+      _id: o._id,
+      order_no: o.order_no,
+      customer_name: customerNameOf(o.user_id),
+      items_summary: summarize((o.items ?? []).map((it) => ({ name: it.product_snapshot?.product_name_th, qty: it.quantity }))),
+      total_amount: o.total_amount,
+      order_status: o.order_status as DashboardRecentOrder["order_status"],
+    }));
+
+    const productionStatus: DashboardProduction[] = productionRes.data
+      .filter((p) => p.production_status === "planned" || p.production_status === "in_progress")
+      .slice(0, 5)
+      .map((p) => ({
+        _id: p._id,
+        production_no: p.production_no,
+        items_summary: summarize(
+          (p.items ?? [])
+            .filter((it) => it.item_status !== "cancelled")
+            .map((it) => ({ name: typeof it.product_id === "object" ? it.product_id?.product_name_th : undefined, qty: it.planned_qty })),
+        ),
+        production_status: p.production_status as DashboardProduction["production_status"],
+        due_date: p.production_date,
+      }));
+
+    return {
+      data: {
+        stats: {
+          revenue_today: overviewToday.data.revenue,
+          order_count_today: overviewToday.data.orders.total,
+          pending_order_count: overviewAllTime.data.orders.by_status.pending ?? 0,
+          low_stock_count:
+            overviewAllTime.data.low_stock.products + overviewAllTime.data.low_stock.ingredients,
+        },
+        recent_orders: recentOrders,
+        low_stock: lowStock,
+        top_products: topProducts,
+        production_status: productionStatus,
+        generated_at: new Date().toISOString(),
+      },
+    };
+  },
+};

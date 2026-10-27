@@ -1,0 +1,124 @@
+import mongoose from "mongoose";
+
+const promotionSchema = new mongoose.Schema({
+    promotion_code: { //รหัสโปรโมชั่น
+        type: String,
+        required: true,
+    },
+    promotion_name: { //ชื่อโปรโมชั่น
+        type: String,
+        required: true,
+    },
+    promotion_desc: { //รายละเอียดโปรโมชั่น
+        type: String,
+        required: false,
+    },
+    discount_type: { //ประเภทส่วนลด เช่น เปอร์เซ็นต์, จำนวนเงิน, ส่งฟรี เป็นต้น
+        type: String,
+        required: true,
+        enum: ["Percentage", "Amount", "FreeShipping"],
+    },
+    is_active: { //เปิด/ปิดการใช้งานคูปองด้วยตนเอง แยกจากช่วงวันที่เริ่ม-สิ้นสุด
+        type: Boolean,
+        default: true,
+    },
+    applicable_channels: { //ช่องทางที่ใช้โปรโมชั่นนี้ได้ — แยกหน้าร้าน (instore) กับออนไลน์ (online)
+        type: [String],
+        enum: ["online", "instore"],
+        default: ["online", "instore"],
+    },
+    audience: { //กลุ่มลูกค้าที่ใช้ได้ — all = ทุกคน (รวมบัญชีลูกค้าทั่วไปของ POS) · members = เฉพาะสมาชิก (ไม่ใช่ลูกค้าทั่วไป)
+        type: String,
+        enum: ["all", "members"],
+        default: "all",
+    },
+    stackable: { //ใช้ร่วมกับโปรอื่นในบิลเดียวได้ (POS ส่ง promotion_ids) — ทุกตัวในบิลต้องเป็น true ถึงจะซ้อนได้
+        type: Boolean,
+        default: false,
+    },
+    // เงินเป็นบาท ทศนิยมไม่เกิน 2 ตำแหน่ง (ทั้ง DB และ API — docs/money-units.md) เฉพาะตอน discount_type === "Amount"
+    // ตอน "Percentage" เป็นตัวเลข % (0-100) ไม่ใช่เงิน · "FreeShipping" ไม่ใช้ (ปล่อย 0) — ดู promotionService
+    discount_value: { //ค่าของส่วนลด
+        type: Number,
+        required: true,
+    },
+    // เงินเป็นบาท ทศนิยมไม่เกิน 2 ตำแหน่ง (ทั้ง DB และ API — docs/money-units.md) — ยอดขั้นต่ำ เทียบกับ subtotal
+    min_order_amount: { //จำนวนเงินขั้นต่ำในการใช้โปรโมชั่นนี้ — ถ้ากำหนด applicable_products ไว้ด้วย
+        // จะเช็คเฉพาะยอดรวมของ "สินค้าที่ร่วมรายการ" เท่านั้น ไม่ใช่ยอดทั้งบิล (เช่น "คละสินค้า A/B ครบ 200 ลด 50")
+        type: Number,
+        required: false,
+    },
+    applicable_products: { //สินค้าที่ใช้โปรโมชั่นนี้ได้ — ว่าง [] = ใช้ได้กับสินค้าทุกชิ้น (ไม่จำกัด)
+        type: [{ type: mongoose.Schema.Types.ObjectId, ref: "Products" }],
+        default: [],
+    },
+    applicable_categories: { //หมวดหมู่สินค้าที่ใช้โปรโมชั่นนี้ได้ — ว่าง [] = ไม่จำกัดหมวดหมู่
+        // ใช้แทน applicable_products เวลาต้องการให้ครอบคลุมทั้งหมวด (เช่น "ขนมปังทุกชนิด") แทนที่จะไล่เลือก
+        // ทีละชิ้น — ปกติเลือกใช้แค่ทางใดทางหนึ่ง (products หรือ categories) ไม่ใช้พร้อมกัน
+        type: [{ type: mongoose.Schema.Types.ObjectId, ref: "ProductCategories" }],
+        default: [],
+    },
+    min_quantity: { //จำนวนชิ้นขั้นต่ำรวมของ "สินค้าที่ร่วมรายการ" (applicable_products/applicable_categories)
+        // ที่ต้องมีในตะกร้า เช่น "ซื้อครบ 3 ชิ้น ลด 10 บาท" — null = ไม่กำหนด (เช็คแค่ min_order_amount แทน ถ้ามี)
+        type: Number,
+        required: false,
+    },
+    // เงินเป็นบาท ทศนิยมไม่เกิน 2 ตำแหน่ง (ทั้ง DB และ API — docs/money-units.md) — เพดานส่วนลด (มีความหมายเฉพาะตอน Percentage)
+    max_discount_amount: { //จำนวนเงินสูงสุดที่สามารถใช้ส่วนลดนี้ได้ (ถ้า discount_type เป็น Percentage)
+        type: Number,
+        required: false,
+    },
+    usage_limit: { //จำนวนครั้งที่สามารถใช้โปรโมชั่นนี้ได้ (ถ้าไม่จำกัดให้เป็น null)
+        type: Number,
+        required: false,
+    },
+    used_count: { //จำนวนครั้งที่โปรโมชั่นนี้ถูกใช้ไปแล้ว
+        type: Number,
+        default: 0,
+    },
+    max_user_per_user: { //จำนวนครั้งที่ผู้ใช้แต่ละคนสามารถใช้โปรโมชั่นนี้ได้ (ถ้าไม่จำกัดให้เป็น null)
+        type: Number,
+        required: false,
+    },
+    // แต้มสะสมที่ใช้แลกเป็นคูปองส่วนตัว (null = ไม่เปิดให้แลก) — โปรที่ตั้งค่านี้ใช้ได้ผ่าน "คูปองของฉัน" เท่านั้น
+    // กรอกเป็นโค้ดตรง ๆ ไม่ได้ (couponService · customer-backend-merge.md §8.11)
+    points_cost: {
+        type: Number,
+        default: null,
+        min: 0,
+    },
+    start_date: { //วันที่เริ่มต้นโปรโมชั่น
+        type: Date,
+        required: true,
+    },
+    end_date: { //วันที่สิ้นสุดโปรโมชั่น
+        type: Date,
+        required: true,
+    },
+    created_by: { //ผู้ที่สร้างโปรโมชั่นนี้
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Users",
+        required: true,
+    },
+    deleted_at: {
+      type: Date,
+      default: null,
+    },
+},
+{
+    timestamps: {  createdAt: "created_at", updatedAt: "updated_at" },
+});
+
+promotionSchema.index({ promo_code: 1 });
+promotionSchema.index({ start_date: 1, end_date: 1 });
+// promotion_code ห้ามซ้ำ แต่เฉพาะโปรโมชันที่ยังไม่ถูกลบ (partial unique) — BACKLOG2 §1: เดิมเป็น
+// unique ธรรมดา ลบโปรโมชันทิ้งแล้วสร้างโค้ดเดิมซ้ำไม่ได้อีกเลย (โค้ดสั้น ๆ มักถูกใช้ซ้ำปีต่อปี)
+promotionSchema.index(
+  { promotion_code: 1 },
+  { unique: true, partialFilterExpression: { deleted_at: null } }
+);
+
+const PromotionModel = 
+  mongoose.models.Promotions || mongoose.model("Promotions", promotionSchema);
+
+export default PromotionModel;

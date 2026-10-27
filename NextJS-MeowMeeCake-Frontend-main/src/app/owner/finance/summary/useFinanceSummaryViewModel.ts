@@ -1,0 +1,198 @@
+"use client";
+// ─────────────────────────────────────────────────────────────
+// ViewModel ของ Finance P&L — รายรับจาก backend (revenue-by-channel: ออเดอร์เว็บ/หน้าร้าน + พรีออเดอร์ ที่ชำระแล้ว)
+// + ค่าใช้จ่ายจาก expenses (โหลดครั้งเดียว) → คำนวณต้นทุน/กำไรตามช่วงเวลาที่เลือก
+// เดิมรวมรายรับเองจาก /admin/orders (limit 200, ไม่นับพรีออเดอร์ = 0 ตายตัว) และแยกยอดออนไลน์ด้วย
+// revenue-by-type ที่ backend #52 เปลี่ยน shape ไปแล้ว (ไม่มี .online → NaN ทั้งตาราง) — BACKLOG2 §3
+//
+// ต้นทุนขาย (COGS) แสดง 2 วิธีคู่กัน (Final-Backlog Q1 — เจ้าของร้านเลือกดูทั้งสองแบบ):
+//   ตามค่าใช้จ่าย = ค่าใช้จ่ายหมวด "วัตถุดิบ"/"บรรจุภัณฑ์" ที่บันทึกจริง (งบกำไร-ขาดทุนหลักใช้แบบนี้)
+//   ตามสูตร      = recipe_cogs จาก revenue-by-channel (Σ cost_per_unit × จำนวนของสินค้าที่ขายได้)
+// ค่าใช้จ่ายดำเนินงาน (หมวดอื่น) เท่ากันทั้งสองแบบ — แบบตามสูตรไม่หักค่าวัตถุดิบที่ซื้อเข้าซ้ำ
+// ─────────────────────────────────────────────────────────────
+import { useMemo, useState } from "react";
+import { useQueries, useQuery } from "@tanstack/react-query";
+import { useTranslations, useLocale } from "next-intl";
+import dayjs, { type Dayjs } from "dayjs";
+import { expensesService } from "@/services/expenses";
+import { reportsService } from "@/services/reports";
+import { formatCurrency, formatDate } from "@/i18n/format";
+import { COGS_EXPENSE_CATEGORIES } from "@/constants/enumConfig";
+import type { ExpenseCategory } from "@/constants/enumConfig";
+import { getRangeStartEnd, type PeriodType } from "@/utils/period";
+import { LIST_ALL } from "@/lib/http";
+import { revenueKey, trendBuckets as buildTrendBuckets } from "./summaryRanges";
+
+/** ปีค่าใช้จ่ายที่เก่ากว่านี้ถือว่าพิมพ์ผิด — ไม่นับเป็นปีแรกของตารางรายปี */
+const MIN_EXPENSE_YEAR = 2000;
+
+export interface PnLRow {
+  key: string;
+  label: string;
+  amount: number;
+  kind: "header" | "line" | "subtotal" | "gross" | "net";
+}
+
+export function useFinanceSummaryViewModel() {
+  const t = useTranslations();
+  const locale = useLocale();
+
+  const expensesQ = useQuery({ queryKey: ["expenses"], queryFn: () => expensesService.list({ limit: LIST_ALL }) });
+  const expenses = useMemo(() => expensesQ.data?.data ?? [], [expensesQ.data]);
+
+  const [period, setPeriod] = useState<PeriodType>("month");
+  const [selectedDate, setSelectedDate] = useState<Dayjs>(dayjs());
+
+  const [rangeStart, rangeEnd] = useMemo(() => getRangeStartEnd(period, selectedDate), [period, selectedDate]);
+
+  // รายรับแยกตามช่องทาง (คิดที่ backend ทั้งหมด — ชำระแล้ว, ช่วงวันที่ตาม created_at เหมือนที่หน้านี้เคยกรองเอง)
+  const revenueQ = useQuery({
+    queryKey: revenueKey(rangeStart.toISOString(), rangeEnd.toISOString()),
+    queryFn: () => reportsService.revenueByChannel({ date_from: rangeStart.toISOString(), date_to: rangeEnd.toISOString() }),
+  });
+  // isPending (ไม่ใช่ isLoading) — หน้านี้ render ฝั่ง server ด้วย (OwnerLayout SSR_PAGES) ตอนนั้น isLoading = false
+  const isLoading = expensesQ.isPending || revenueQ.isPending;
+  // รายรับมาจาก revenueQ อย่างเดียว — ถ้าโหลดไม่ได้ต้องบอกผู้ใช้ ห้ามโชว์รายรับ 0 / กำไรติดลบที่ผิดเงียบ ๆ
+  const isError = expensesQ.isError || revenueQ.isError;
+
+  const expensesInRange = useMemo(
+    () => expenses.filter((e) => {
+      const d = dayjs(e.date);
+      return !d.isBefore(rangeStart) && !d.isAfter(rangeEnd);
+    }),
+    [expenses, rangeStart, rangeEnd],
+  );
+
+  const revenue = revenueQ.data;
+  const webIncome = revenue?.web ?? 0;
+  const posIncome = revenue?.pos ?? 0;
+  const preorderIncome = revenue?.preorder ?? 0;
+  // ออเดอร์เลขรุ่นเก่า (ก่อนแยก ORD-/POS-) — โชว์แถวเฉพาะเมื่อมียอด
+  const otherIncome = revenue?.other ?? 0;
+  const totalIncome = revenue?.total ?? 0;
+  const orderCount = revenue?.orders ?? 0;
+
+  const expenseByCategory = useMemo(() => {
+    const m = new Map<ExpenseCategory, number>();
+    expensesInRange.forEach((e) => m.set(e.category, (m.get(e.category) ?? 0) + e.amount));
+    return m;
+  }, [expensesInRange]);
+
+  const totalCogs = COGS_EXPENSE_CATEGORIES.reduce((s, c) => s + (expenseByCategory.get(c) ?? 0), 0);
+  const grossProfit = totalIncome - totalCogs;
+
+  const opexEntries = Array.from(expenseByCategory.entries()).filter(([cat]) => !COGS_EXPENSE_CATEGORIES.includes(cat));
+  const totalOpex = opexEntries.reduce((s, [, v]) => s + v, 0);
+  const netProfit = grossProfit - totalOpex;
+
+  // วิธีตามสูตร — null = backend ยังไม่ส่ง recipe_cogs (แสดง "—" แทนตัวเลขผิด)
+  const recipeCogs = revenue?.recipe_cogs ?? null;
+  const cogsMethods = [
+    { key: "expense", label: t("finance.cogsMethodExpense"), cogs: totalCogs as number | null },
+    { key: "recipe", label: t("finance.cogsMethodRecipe"), cogs: recipeCogs },
+  ].map((m) => ({
+    ...m,
+    gross: m.cogs == null ? null : totalIncome - m.cogs,
+    net: m.cogs == null ? null : totalIncome - m.cogs - totalOpex,
+  }));
+
+  const pnlRows: PnLRow[] = useMemo(() => {
+    const rows: PnLRow[] = [
+      { key: "income_header", label: t("finance.rowIncomeHeader"), amount: 0, kind: "header" },
+      { key: "web_sales", label: t("finance.rowWebSales"), amount: webIncome, kind: "line" },
+      { key: "pos_sales", label: t("finance.rowPosSales"), amount: posIncome, kind: "line" },
+      { key: "preorder_sales", label: t("finance.rowPreorderSales"), amount: preorderIncome, kind: "line" },
+      ...(otherIncome > 0 ? [{ key: "other_sales", label: t("finance.rowOtherSales"), amount: otherIncome, kind: "line" as const }] : []),
+      { key: "total_income", label: t("finance.rowTotalIncome"), amount: totalIncome, kind: "subtotal" },
+      { key: "cogs_header", label: t("finance.rowCogsHeader"), amount: 0, kind: "header" },
+      ...COGS_EXPENSE_CATEGORIES
+        .filter((c) => (expenseByCategory.get(c) ?? 0) > 0)
+        .map((c) => ({ key: `cogs_${c}`, label: t(`enums.expenseCategory.${c}`), amount: expenseByCategory.get(c) ?? 0, kind: "line" as const })),
+      { key: "total_cogs", label: t("finance.rowTotalCogs"), amount: totalCogs, kind: "subtotal" },
+      { key: "gross_profit", label: t("finance.rowGrossProfit"), amount: grossProfit, kind: "gross" },
+      { key: "opex_header", label: t("finance.rowOpexHeader"), amount: 0, kind: "header" },
+      ...opexEntries.map(([cat, amt]) => ({ key: `opex_${cat}`, label: t(`enums.expenseCategory.${cat}`), amount: amt, kind: "line" as const })),
+      { key: "total_opex", label: t("finance.rowTotalOpex"), amount: totalOpex, kind: "subtotal" },
+      { key: "net_profit", label: t("finance.rowNetResult"), amount: netProfit, kind: "net" },
+    ];
+    return rows;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [webIncome, posIncome, preorderIncome, otherIncome, totalIncome, totalCogs, grossProfit, totalOpex, netProfit, expenseByCategory, opexEntries, locale]);
+
+  // ── ตารางเปรียบเทียบ — ตามช่วงเวลาที่เลือก (ช่วงของแต่ละแบบดู summaryRanges.trendBuckets) ──
+  // รายรับต่อช่วงจาก revenue-by-channel ช่วงละ 1 request (นับพรีออเดอร์ด้วย ตัวเลขชุดเดียวกับตาราง P&L)
+  // · รายจ่ายรวมจากรายการค่าใช้จ่ายที่วันที่อยู่ในช่วง
+  // ข้ามวันที่ที่อ่านไม่ได้ / ปีที่พิมพ์ผิด (เช่น 0202) — ไม่งั้นปีเป็น NaN (ตารางว่าง) หรือสร้างช่วงรายปีนับพันช่วง
+  const firstExpenseYear = useMemo(
+    () =>
+      expenses.reduce((y, e) => {
+        const d = dayjs(e.date);
+        return d.isValid() && d.year() >= MIN_EXPENSE_YEAR ? Math.min(y, d.year()) : y;
+      }, Infinity),
+    [expenses],
+  );
+  const trendBuckets = useMemo(
+    () => buildTrendBuckets(period, selectedDate, firstExpenseYear),
+    [period, selectedDate, firstExpenseYear],
+  );
+  const trendQs = useQueries({
+    queries: trendBuckets.map((m) => ({
+      queryKey: revenueKey(m.from, m.to),
+      queryFn: () => reportsService.revenueByChannel({ date_from: m.from, date_to: m.to }),
+    })),
+  });
+  const trendIncome = trendQs.map((q) => q.data?.total ?? 0);
+  const trendIncomeKey = trendIncome.join(",");
+
+  const monthlyTrend = useMemo(() => {
+    const intlLocale = locale === "en" ? "en-US" : "th-TH";
+    const label = (b: (typeof trendBuckets)[number]) => {
+      if (period === "day") return formatDate(b.from, locale);
+      if (period === "week") return `${formatDate(b.from, locale)} – ${formatDate(b.to, locale)}`;
+      if (period === "quarter") return t("finance.quarterLabel", { n: b.start.quarter(), year: b.start.year() });
+      if (period === "year") return String(b.start.year());
+      return new Intl.DateTimeFormat(intlLocale, { month: "short", year: "numeric" }).format(b.start.toDate());
+    };
+    return trendBuckets.map((b, i) => {
+      const expense = expenses.reduce((s, e) => {
+        const d = dayjs(e.date);
+        return !d.isBefore(b.start) && !d.isAfter(b.end) ? s + e.amount : s;
+      }, 0);
+      const income = trendIncome[i];
+      return { key: b.key, label: label(b), income, expense, profit: income - expense };
+    });
+    // trendIncome เป็น array ใหม่ทุก render — ใช้ trendIncomeKey แทน
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trendBuckets, trendIncomeKey, expenses, period, locale]);
+
+  // ── KPI ──
+  const daysInPeriod = Math.max(1, rangeEnd.diff(rangeStart, "day") + 1);
+  const kpis = [
+    { key: "margin", label: t("finance.kpiNetMargin"), value: totalIncome > 0 ? `${((netProfit / totalIncome) * 100).toFixed(1)}%` : "—" },
+    { key: "avgRevenue", label: t("finance.kpiAvgRevenuePerDay"), value: formatCurrency(Math.round(totalIncome / daysInPeriod), locale) },
+    { key: "avgOrders", label: t("finance.kpiAvgOrdersPerDay"), value: (orderCount / daysInPeriod).toFixed(1) },
+    { key: "avgOrderValue", label: t("finance.kpiAvgOrderValue"), value: orderCount > 0 ? formatCurrency(Math.round(totalIncome / orderCount), locale) : "—" },
+  ];
+
+  const periodLabel = useMemo(() => {
+    if (period === "day") return formatDate(selectedDate.toISOString(), locale);
+    if (period === "week") return `${formatDate(rangeStart.toISOString(), locale)} – ${formatDate(rangeEnd.toISOString(), locale)}`;
+    if (period === "quarter") return t("finance.quarterLabel", { n: selectedDate.quarter(), year: selectedDate.year() });
+    if (period === "year") return String(selectedDate.year());
+    return new Intl.DateTimeFormat(locale === "en" ? "en-US" : "th-TH", { month: "long", year: "numeric" }).format(selectedDate.toDate());
+  }, [period, selectedDate, rangeStart, rangeEnd, locale, t]);
+
+  return {
+    isLoading,
+    isError,
+    refetch: () => { revenueQ.refetch(); expensesQ.refetch(); },
+    period, setPeriod,
+    selectedDate, setSelectedDate,
+    rangeStart, rangeEnd, periodLabel,
+
+    totalIncome, totalCogs, totalOpex, netProfit, orderCount, cogsMethods,
+    hasData: totalIncome > 0 || expensesInRange.length > 0,
+
+    pnlRows, monthlyTrend, kpis,
+  };
+}

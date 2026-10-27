@@ -1,0 +1,58 @@
+"use client";
+// สถานะรีวิว / ปุ่ม "รีวิวสินค้า" ในประวัติ/รายละเอียดออเดอร์และพรีออเดอร์ (BACKLOG3-merge D7)
+// แสดงเฉพาะ completed + ชำระแล้ว · รีวิวครบทุกรายการ = ป้าย "รีวิวแล้ว" แทนปุ่ม
+// showReason (หน้ารายละเอียด) = ยังรีวิวไม่ได้ก็บอกเงื่อนไข เช่น "รีวิวได้หลังจากคำสั่งซื้อชำระเงินแล้ว"
+// ยังรีวิวไม่ได้ / กำลังโหลด = แสดง fallback (เช่น ป้ายสถานะคำสั่งซื้อในหน้าประวัติ) · ไม่ส่ง = ไม่แสดงอะไร
+import type { ReactNode } from "react";
+import Link from "next/link";
+import { useTranslations } from "next-intl";
+import { Info, Star } from "lucide-react";
+import type { ReviewKind } from "@/services/shopReviews";
+import { canReview, reviewBlockReason, useReviewedItems } from "../../hooks/useReviewedItems";
+
+export default function ReviewLink({
+  kind,
+  doc,
+  itemIds,
+  href,
+  className,
+  reviewedClassName = "whitespace-nowrap px-2 text-xs font-semibold text-green-700",
+  fallback = null,
+  showReason = false,
+}: {
+  kind: ReviewKind;
+  doc: { order_status: string; payment_status: string };
+  /** id ของรายการในเอกสาร — undefined ระหว่างโหลดรายละเอียด */
+  itemIds: string[] | undefined;
+  href: string;
+  className: string;
+  /** สไตล์ป้าย "รีวิวแล้ว" */
+  reviewedClassName?: string;
+  /** แสดงแทนเมื่อยังรีวิวไม่ได้ หรือข้อมูลยังโหลดไม่เสร็จ */
+  fallback?: ReactNode;
+  /** ยังรีวิวไม่ได้ = บอกเงื่อนไข (หน้ารายละเอียด) แทนการไม่แสดงอะไร — ข้อความเดียวกับ backend */
+  showReason?: boolean;
+}) {
+  const t = useTranslations("shop.orders");
+  const eligible = canReview(doc);
+  const { reviewed, loaded } = useReviewedItems(kind, eligible);
+  const reason = reviewBlockReason(doc);
+  if (reason && showReason) {
+    return (
+      <span className="inline-flex items-center gap-1.5 rounded-full border border-stone-200 bg-stone-50 px-3 py-1 text-xs font-medium text-stone-600">
+        <Info size={14} className="shrink-0" aria-hidden="true" />
+        {t(`reviewBlocked.${reason}`, { label: kind === "order" ? t("labelOrder") : t("labelPreorder") })}
+      </span>
+    );
+  }
+  if (!eligible || !loaded || !itemIds?.length) return <>{fallback}</>;
+
+  const left = itemIds.filter((id) => !reviewed.has(id)).length;
+  if (left === 0) return <span className={reviewedClassName}>{t("reviewed")}</span>;
+  return (
+    <Link href={href} className={className}>
+      <Star size={16} className="shrink-0 fill-current" aria-hidden="true" />
+      {itemIds.length > 1 ? t("reviewCount", { n: left }) : t("reviewProducts")}
+    </Link>
+  );
+}

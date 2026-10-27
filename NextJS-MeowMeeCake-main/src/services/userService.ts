@@ -1,0 +1,527 @@
+/**
+ * userService — จัดการผู้ใช้ (Users) ทั้งลูกค้าและพนักงาน + ตรรกะการยืนยันตัวตน
+ *
+ * - CRUD โปรไฟล์ผู้ใช้ (soft delete ผ่าน deleted_at)
+ * - จัดการรหัสผ่าน (hash ด้วย bcryptjs — model ไม่มี pre-save hook จึงต้องทำที่ชั้นนี้)
+ * - verifyCredentials(): ตรวจอีเมล/รหัสผ่าน พร้อมนับ failed_login_attempts และ lockout
+ *
+ * หมายเหตุ: service นี้ไม่ยุ่งกับ session/JWT/cookie — route handler (controller) เป็นผู้จัดการ
+ */
+import bcrypt from "bcryptjs";
+import dbConnect from "../lib/dbConnect";
+import { badRequest, conflict, forbidden, notFound, unauthorized, HttpError } from "../lib/httpError";
+import { assertObjectId } from "../lib/objectId";
+import { assertRefExists } from "../lib/refs";
+import { buildMeta, escapeRegExp, type Pagination } from "../lib/queryParams";
+import { softDeleteDoc, restoreDoc } from "../lib/crudService";
+import userModel from "../models/userModel";
+import roleModel from "../models/roleModel";
+import { GUEST_CUSTOMER_EMAIL } from "../lib/posGuest";
+import * as pointsService from "./pointsService";
+import type { z } from "zod";
+import type { updateProfileBody, createUserBody, updateUserBody } from "../schemas/user";
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+
+type UpdateProfileInput = z.infer<typeof updateProfileBody>;
+type CreateUserBody = z.infer<typeof createUserBody>;
+type UpdateUserBody = z.infer<typeof updateUserBody>;
+
+// ── ค่าคงที่นโยบายรหัสผ่าน / การล็อกบัญชี ─────────────────────
+export const BCRYPT_ROUNDS = 10;
+export const MIN_PASSWORD_LENGTH = 8;
+export const MAX_FAILED_ATTEMPTS = 5;
+export const LOCKOUT_MINUTES = 15;
+
+// ── ฟิลด์ลับที่ห้ามส่งกลับออก API และห้ามให้เขียนผ่าน CRUD ปกติ ──
+const SECRET_FIELDS = [
+  "password",
+  "email_verify_token",
+  "verification_token_expiry",
+  "reset_password_token",
+  "reset_password_token_expiry",
+] as const;
+
+// ── ฟิลด์ที่เจ้าของบัญชีเห็นได้คนเดียว (ไม่ออกทาง /admin/users) — บัญชีพร้อมเพย์อาจเป็นเลขบัตรประชาชน
+// หลังร้านเห็นผ่าน withRefundAccount() เฉพาะออเดอร์/พรีออเดอร์ที่รอโอนคืนเท่านั้น (frontend Q-BE12)
+const SELF_ONLY_FIELDS = ["refund_promptpay_id", "refund_promptpay_name"] as const;
+
+const SELECT_PUBLIC = [...SECRET_FIELDS, ...SELF_ONLY_FIELDS].map((f) => `-${f}`).join(" ");
+/** สำหรับเจ้าของบัญชีเอง (GET/PATCH /shop/me) — ตัดแค่ฟิลด์ลับ */
+const SELECT_SELF = SECRET_FIELDS.map((f) => `-${f}`).join(" ");
+
+// PROFILE_FIELDS/EMPLOYMENT_FIELDS (whitelist สำหรับ pick()) ถูกลบไปแล้ว — field ที่เขียนได้
+// ตอนนี้กำหนดที่ schemas/user.ts (updateProfileBody/createUserBody/updateUserBody) แทน
+
+// ── Types ────────────────────────────────────────────────────
+// input type ของ createUser/updateUser มาจาก schemas/user.ts (CreateUserBody/UpdateUserBody
+// ด้านล่าง) โดยตรงแล้ว — ไม่มี interface แยกซ้ำเหมือนก่อน adopt zod
+
+export interface ListUserQuery {
+  pagination: Pagination;
+  search?: string;
+  role_id?: string;
+  /** กรองตามประเภทของบทบาท (roleModel.role_type) — ผู้ใช้ไม่ได้เก็บประเภทไว้เอง ต้องอ้างผ่าน role_id (เช่น หน้าพนักงาน = owner + staff) */
+  role_type?: ("owner" | "staff" | "customer")[];
+  is_active?: boolean;
+  employment_type?: "full_time" | "part_time";
+  includeDeleted?: boolean;
+  sort?: Record<string, 1 | -1>;
+}
+
+// ── Helpers ──────────────────────────────────────────────────
+/** ลบฟิลด์ลับ (password/token ต่าง ๆ) ออกจาก doc ก่อนส่งกลับ — export ให้ authService ใช้ร่วม
+ *  (BACKLOG3 §4 — กันต้อง query ซ้ำแค่เพื่อได้ doc ที่ strip secrets แล้ว) */
+export function stripSecrets<T extends Record<string, any>>(doc: T): Partial<T> {
+  const clone: Record<string, any> = { ...doc };
+  for (const f of SECRET_FIELDS) delete clone[f];
+  return clone as Partial<T>;
+}
+
+export function assertPasswordStrength(pw: string): void {
+  if (typeof pw !== "string" || pw.length < MIN_PASSWORD_LENGTH) {
+    throw badRequest(`รหัสผ่านต้องยาวอย่างน้อย ${MIN_PASSWORD_LENGTH} ตัวอักษร`);
+  }
+}
+
+export function hashPassword(pw: string): Promise<string> {
+  return bcrypt.hash(pw, BCRYPT_ROUNDS);
+}
+
+// ── CREATE ───────────────────────────────────────────────────
+// required field / auth_provider enum validate ที่ route ผ่าน schemas/user.ts createUserBody แล้ว
+export async function createUser(input: CreateUserBody) {
+  await dbConnect();
+  await assertRefExists(roleModel, input.role_id, "บทบาท", "role_id");
+
+  const payload: Record<string, any> = {
+    ...input,
+    is_active: input.is_active ?? true,
+  };
+
+  if (input.auth_provider === "local") {
+    if (!input.password) throw badRequest("บัญชีแบบ local ต้องระบุ password");
+    assertPasswordStrength(input.password);
+    payload.password = await hashPassword(input.password);
+  } else {
+    if (!input.googleId) throw badRequest("บัญชีแบบ google ต้องระบุ googleId");
+    payload.googleId = input.googleId;
+    payload.password = null;
+    payload.is_email_verified = true;
+  }
+
+  try {
+    const doc = await userModel.create(payload);
+    return stripSecrets(doc.toObject());
+  } catch (err: any) {
+    if (err?.code === 11000) throw new HttpError("อีเมลนี้ถูกใช้งานแล้ว", 409, "CONFLICT");
+    throw err;
+  }
+}
+
+// ── READ (list) ──────────────────────────────────────────────
+export async function listUsers(query: ListUserQuery) {
+  await dbConnect();
+
+  const filter: Record<string, any> = {};
+  if (!query.includeDeleted) filter.deleted_at = null;
+  if (query.role_id) {
+    assertObjectId(query.role_id, "role_id");
+    filter.role_id = query.role_id;
+  }
+  if (query.role_type?.length) {
+    // บทบาทที่ถูกลบแบบ soft delete ก็นับ — ผู้ใช้ที่ยังผูกอยู่ต้องไม่หายจากรายการเพราะบทบาทถูกลบ
+    const roleIds = (await roleModel.find({ role_type: { $in: query.role_type } }).select("_id").lean()).map((r) => String(r._id));
+    // ระบุทั้ง role_id และ role_type = ต้องเข้าเงื่อนไขทั้งคู่ (role_id ที่ไม่อยู่ในประเภทที่ขอ → ไม่มีผลลัพธ์)
+    const allowed = query.role_id ? roleIds.filter((id) => id === String(query.role_id)) : roleIds;
+    filter.role_id = { $in: allowed };
+  }
+  if (typeof query.is_active === "boolean") filter.is_active = query.is_active;
+  if (query.employment_type) filter.employment_type = query.employment_type;
+  if (query.search) {
+    const rx = new RegExp(escapeRegExp(query.search.trim()), "i");
+    filter.$or = [{ user_fullname: rx }, { email: rx }, { user_phone: rx }];
+  }
+
+  const [items, total] = await Promise.all([
+    userModel
+      .find(filter)
+      .select(SELECT_PUBLIC)
+      .sort(query.sort ?? { created_at: -1 })
+      .skip(query.pagination.skip)
+      .limit(query.pagination.limit)
+      .populate("role_id", "role_name role_type")
+      .lean(),
+    userModel.countDocuments(filter),
+  ]);
+
+  return { items, meta: buildMeta(total, query.pagination) };
+}
+
+// ── READ (single) ────────────────────────────────────────────
+/** self = true → รวมฟิลด์ที่เจ้าของบัญชีเห็นคนเดียว (SELF_ONLY_FIELDS) — ใช้กับ GET /shop/me เท่านั้น */
+export async function getUserById(id: string, opts: { includeDeleted?: boolean; self?: boolean } = {}) {
+  await dbConnect();
+  assertObjectId(id);
+
+  const filter: Record<string, any> = { _id: id };
+  if (!opts.includeDeleted) filter.deleted_at = null;
+
+  const user = await userModel
+    .findOne(filter)
+    .select(opts.self ? SELECT_SELF : SELECT_PUBLIC)
+    .populate("role_id", "role_name role_type")
+    .lean();
+  if (!user) throw notFound("ไม่พบผู้ใช้ที่ระบุ");
+  return user;
+}
+
+// ── บัญชี "ลูกค้าทั่วไป" ของ POS (GET /admin/pos/guest-customer) ─────
+/** คืนเฉพาะ id + ชื่อ + อีเมล · ยังไม่ได้ seed (หรือถูกลบ/ปิดใช้งาน) = 404 */
+export async function getPosGuestCustomer() {
+  await dbConnect();
+  const guest = await userModel
+    .findOne({ email: GUEST_CUSTOMER_EMAIL.toLowerCase(), deleted_at: null, is_active: { $ne: false } })
+    .select("_id user_fullname email")
+    .lean();
+  if (!guest) throw notFound("ยังไม่มีบัญชีลูกค้าทั่วไปสำหรับหน้าร้าน — รัน npm run seed");
+  return guest;
+}
+
+// ── หาสมาชิกด้วยเบอร์มือถือที่ POS (GET /admin/pos/member) ─────
+/** เบอร์ไทย 10 หลักขึ้นต้น 0 — ตัดขีด/ช่องว่างออกก่อน (รูปแบบเดียวกับ schemas/user phone) */
+const POS_MEMBER_PHONE = /^0\d{9}$/;
+/** เบอร์ซ้ำได้ (ไม่ได้ unique) — คืนให้เลือกไม่เกินเท่านี้ */
+const POS_MEMBER_LIMIT = 5;
+
+/**
+ * สมาชิก (role_type customer · ใช้งานอยู่ · ไม่ใช่บัญชีลูกค้าทั่วไป) ที่ใช้เบอร์นี้ + แต้มคงเหลือ
+ * ผูกออเดอร์หน้าร้านกับ _id ที่ได้ → ปิดงาน completed แล้ว pointsService.syncOrderPoints ให้แต้มเอง
+ * คืนเฉพาะชื่อ/เบอร์/แต้ม (ไม่มีอีเมล) — พนักงานเคาน์เตอร์ใช้ยืนยันตัวลูกค้าเท่านั้น
+ */
+export async function findPosMembersByPhone(rawPhone: string) {
+  const phone = rawPhone.replace(/[\s-]/g, "");
+  if (!POS_MEMBER_PHONE.test(phone)) throw badRequest("เบอร์โทรศัพท์ต้องเป็นตัวเลข 10 หลัก ขึ้นต้นด้วย 0");
+  await dbConnect();
+  const customerRoles = await roleModel.find({ role_type: "customer" }).select("_id").lean();
+  const users = await userModel
+    .find({
+      user_phone: phone,
+      role_id: { $in: customerRoles.map((r) => r._id) },
+      email: { $ne: GUEST_CUSTOMER_EMAIL.toLowerCase() },
+      deleted_at: null,
+      is_active: { $ne: false },
+    })
+    .select("_id user_fullname user_phone")
+    .sort({ updated_at: -1 })
+    .limit(POS_MEMBER_LIMIT)
+    .lean<{ _id: unknown; user_fullname: string; user_phone: string }[]>();
+  const members = await Promise.all(
+    users.map(async (u) => ({ ...u, points_balance: await pointsService.getBalance(String(u._id)) }))
+  );
+  return { members, baht_per_point: pointsService.POINT_RULES.BAHT_PER_POINT };
+}
+
+// ── UPDATE (โปรไฟล์ + ข้อมูลการจ้างงาน ไม่รวมรหัสผ่าน) ────────
+export async function updateUser(id: string, input: UpdateUserBody) {
+  await dbConnect();
+  assertObjectId(id);
+
+  if (input.role_id) {
+    await assertRefExists(roleModel, input.role_id, "บทบาท", "role_id");
+  }
+
+  const payload = { ...input };
+
+  try {
+    const user = await userModel
+      .findOneAndUpdate({ _id: id, deleted_at: null }, { $set: payload }, {
+        returnDocument: "after",
+        runValidators: true,
+      })
+      .select(SELECT_PUBLIC)
+      .lean();
+    if (!user) throw notFound("ไม่พบผู้ใช้ที่ระบุ");
+    return user;
+  } catch (err: any) {
+    if (err?.code === 11000) throw new HttpError("อีเมลนี้ถูกใช้งานแล้ว", 409, "CONFLICT");
+    throw err;
+  }
+}
+
+// ── แก้โปรไฟล์ตัวเอง (ลูกค้า/พนักงาน) — เขียนได้เฉพาะฟิลด์โปรไฟล์ ────
+// PATCH /api/shop/me เป็น caller เดียว — validate ด้วย schemas/user.ts updateProfileBody แล้ว
+// (ไม่ต้อง whitelist ซ้ำด้วย pick())
+export async function updateProfile(id: string, input: UpdateProfileInput) {
+  await dbConnect();
+  assertObjectId(id);
+
+  const payload = { ...input };
+  const user = await userModel
+    .findOneAndUpdate({ _id: id, deleted_at: null }, { $set: payload }, {
+      returnDocument: "after",
+      runValidators: true,
+    })
+    .select(SELECT_SELF)
+    .lean();
+  if (!user) throw notFound("ไม่พบผู้ใช้ที่ระบุ");
+  return user;
+}
+
+// ── บัญชีรับเงินคืนสำหรับหลังร้าน ─────────────────────────────
+export interface RefundAccount {
+  promptpay_id: string;
+  promptpay_name: string | null;
+}
+
+/**
+ * แนบบัญชีพร้อมเพย์รับเงินคืนของลูกค้า (refund_account) ให้ออเดอร์/พรีออเดอร์ที่ "รอโอนคืน"
+ * (ยกเลิกแล้วแต่ยังชำระแล้ว — ลูกค้ายกเลิกเอง backend ไม่คืนอัตโนมัติ · customer-backend-merge.md §8.8)
+ * สถานะอื่น / ลูกค้ายังไม่ตั้งบัญชี = null · ใช้ใน GET /admin/orders/:id และ /admin/preorders/:id (frontend Q-BE12)
+ */
+export async function withRefundAccount<T extends { order_status?: unknown; payment_status?: unknown; user_id?: unknown }>(
+  doc: T
+): Promise<T & { refund_account: RefundAccount | null }> {
+  const awaitingRefund = doc.order_status === "cancelled" && doc.payment_status === "paid";
+  const ref = doc.user_id as { _id?: unknown } | string | null | undefined;
+  const userId = ref && typeof ref === "object" ? ref._id : ref;
+  if (!awaitingRefund || !userId) return { ...doc, refund_account: null };
+
+  await dbConnect();
+  const user = await userModel
+    .findById(userId)
+    .select("refund_promptpay_id refund_promptpay_name")
+    .lean<{ refund_promptpay_id?: string | null; refund_promptpay_name?: string | null } | null>();
+  const account = user?.refund_promptpay_id
+    ? { promptpay_id: user.refund_promptpay_id, promptpay_name: user.refund_promptpay_name ?? null }
+    : null;
+  return { ...doc, refund_account: account };
+}
+
+// ── เปลี่ยนรหัสผ่าน (ผู้ใช้ทำเอง ต้องยืนยันรหัสเดิม) ──────────
+export async function changePassword(
+  id: string,
+  currentPassword: string,
+  newPassword: string
+) {
+  await dbConnect();
+  assertObjectId(id);
+
+  const user = await userModel.findOne({ _id: id, deleted_at: null }).select("+password");
+  if (!user) throw notFound("ไม่พบผู้ใช้ที่ระบุ");
+  if (!user.password) {
+    throw badRequest("บัญชีนี้เข้าสู่ระบบด้วย Google จึงไม่มีรหัสผ่านให้เปลี่ยน");
+  }
+
+  const matched = await bcrypt.compare(currentPassword ?? "", user.password);
+  if (!matched) throw badRequest("รหัสผ่านเดิมไม่ถูกต้อง");
+
+  assertPasswordStrength(newPassword);
+  user.password = await hashPassword(newPassword);
+  user.password_changed_at = new Date(); // session next-auth เดิมหลุด (authGuard)
+  user.reset_password_token = null;
+  user.reset_password_token_expiry = null;
+  await user.save();
+  return { success: true };
+}
+
+// ── ตั้งรหัสผ่านใหม่โดยแอดมิน (ไม่ต้องยืนยันรหัสเดิม + ปลดล็อกบัญชี) ──
+export async function adminSetPassword(id: string, newPassword: string) {
+  await dbConnect();
+  assertObjectId(id);
+  assertPasswordStrength(newPassword);
+
+  const hashed = await hashPassword(newPassword);
+  const user = await userModel
+    .findOneAndUpdate(
+      { _id: id, deleted_at: null },
+      {
+        $set: {
+          password: hashed,
+          password_changed_at: new Date(), // session next-auth เดิมหลุด (authGuard)
+          failed_login_attempts: 0,
+          lockout_until: null,
+          reset_password_token: null,
+          reset_password_token_expiry: null,
+        },
+      },
+      { returnDocument: "after" }
+    )
+    .select(SELECT_PUBLIC)
+    .lean();
+  if (!user) throw notFound("ไม่พบผู้ใช้ที่ระบุ");
+  return user;
+}
+
+// BACKLOG3 §9 — soft-delete/restore เป็น pattern เดียวกับ service อื่นทุกจุด ใช้ primitive กลางแทน
+// (primitive ไม่รองรับ .select() projection ระดับ DB เหมือนเดิม — strip secrets เองใน JS แทนด้วย
+// stripSecrets() ที่มีอยู่แล้ว ผลลัพธ์ท้ายสุดฟิลด์เหมือนเดิมทุกประการ)
+// ── DELETE (soft) / RESTORE ──────────────────────────────────
+export async function deleteUser(id: string) {
+  const user = await softDeleteDoc(userModel, id, {
+    notFoundMsg: "ไม่พบผู้ใช้ที่ระบุ หรือถูกลบไปแล้ว",
+    extraSet: { is_active: false },
+  });
+  return stripSecrets(user);
+}
+
+export async function restoreUser(id: string) {
+  const user = await restoreDoc(userModel, id, {
+    notFoundMsg: "ไม่พบผู้ใช้ที่ถูกลบไว้",
+    extraSet: { is_active: true },
+  });
+  return stripSecrets(user);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  AUTHENTICATION — ตรวจสอบตัวตนด้วยอีเมล + รหัสผ่าน
+// ─────────────────────────────────────────────────────────────
+
+function isLockedOut(user: { lockout_until?: Date | null }): boolean {
+  return !!user.lockout_until && new Date(user.lockout_until).getTime() > Date.now();
+}
+
+/** เหตุผลของ 423 — หน้า login ใช้แยกเคสแล้วนับถอยหลังจาก lockout_until */
+export const ACCOUNT_LOCKED = "ACCOUNT_LOCKED";
+
+/** 423 บัญชีถูกล็อก + เวลาที่ปลดล็อก (details ให้หน้า login แสดงเวลา/นับถอยหลังได้) */
+function lockedError(until: Date): HttpError {
+  const seconds = Math.max(1, Math.ceil((until.getTime() - Date.now()) / 1000));
+  return new HttpError(
+    `บัญชีถูกล็อกชั่วคราวจากการเข้าสู่ระบบผิดหลายครั้ง กรุณาลองใหม่ในอีก ${Math.ceil(seconds / 60)} นาที`,
+    423,
+    "FORBIDDEN",
+    { reason: ACCOUNT_LOCKED, lockout_until: until.toISOString(), retry_after_seconds: seconds },
+  );
+}
+
+/**
+ * ตรวจอีเมล/รหัสผ่าน
+ *  - สำเร็จ  → คืนข้อมูลผู้ใช้ (ตัดฟิลด์ลับออก) + รีเซ็ตตัวนับ + อัปเดต last_login_at
+ *  - ล้มเหลว → เพิ่ม failed_login_attempts, ล็อกบัญชีเมื่อครบ MAX_FAILED_ATTEMPTS, แล้ว throw
+ */
+export async function verifyCredentials(email: string, password: string) {
+  await dbConnect();
+
+  if (!email || !password) throw badRequest("กรุณากรอกอีเมลและรหัสผ่าน");
+
+  // BACKLOG3 §4 — populate role_id ที่นี่เลย (แทนที่ authService.toSessionUser() จะต้อง
+  // roleModel.findById() แยกอีกรอบเมื่อ role_id ไม่ได้ populate มา)
+  const user = await userModel
+    .findOne({ email: String(email).toLowerCase().trim(), deleted_at: null })
+    .select("+password")
+    .populate("role_id", "role_name role_type");
+
+  // ข้อความเดียวกันทุกกรณีที่หา user ไม่เจอ/รหัสผิด กัน user enumeration
+  if (!user) throw unauthorized("อีเมลหรือรหัสผ่านไม่ถูกต้อง");
+  if (!user.is_active) throw forbidden("บัญชีนี้ถูกระงับการใช้งาน");
+  if (isLockedOut(user)) throw lockedError(new Date(user.lockout_until!));
+  // ไม่ดู auth_provider — บัญชีที่สมัครด้วยรหัสผ่านแล้วผูก Google/LINE ทีหลังยังใช้รหัสผ่านได้ (แบบฝั่งลูกค้า)
+  if (!user.password) {
+    throw badRequest(
+      user.auth_provider === "line" ? "บัญชีนี้ต้องเข้าสู่ระบบด้วย LINE" : "บัญชีนี้ต้องเข้าสู่ระบบด้วย Google"
+    );
+  }
+
+  const matched = await bcrypt.compare(password, user.password);
+  if (!matched) {
+    const attempts = (user.failed_login_attempts ?? 0) + 1;
+    const update: Record<string, any> = { failed_login_attempts: attempts };
+    if (attempts >= MAX_FAILED_ATTEMPTS) {
+      update.lockout_until = new Date(Date.now() + LOCKOUT_MINUTES * 60_000);
+      update.failed_login_attempts = 0;
+    }
+    await userModel.updateOne({ _id: user._id }, { $set: update });
+    // ครั้งที่ทำให้ล็อก → บอกทันทีว่าล็อกกี่นาที (เดิมตอบ "รหัสผิด" แล้วผู้ใช้เพิ่งรู้ตอนลองครั้งถัดไป)
+    if (update.lockout_until) throw lockedError(update.lockout_until);
+    throw unauthorized("อีเมลหรือรหัสผ่านไม่ถูกต้อง");
+  }
+
+  // ลูกค้าต้องยืนยันอีเมลก่อนล็อกอิน (ผู้ใช้เลือก 2026-10-05 · customer-backend-merge.md §8.9) — เช็คหลังรหัสถูก
+  // (ไม่บอกสถานะบัญชีกับคนที่ไม่รู้รหัส) · เจ้าของร้าน/พนักงานไม่บังคับ
+  const roleType = (user.role_id as any)?.role_type;
+  if (roleType === "customer" && user.is_email_verified !== true) {
+    throw new HttpError("กรุณายืนยันอีเมลก่อนเข้าสู่ระบบ (ขอส่งอีเมลยืนยันใหม่ได้)", 403, "FORBIDDEN", {
+      reason: "EMAIL_NOT_VERIFIED",
+    });
+  }
+
+  // BACKLOG3 §4 — sync ค่าที่เพิ่ง update ลง doc ในหน่วยความจำด้วย (ไม่ใช่แค่ DB) เพื่อให้
+  // authService.login() คืน user object นี้ตรงต่อผู้เรียกได้เลย โดยไม่ต้อง getUserById() ซ้ำ
+  const now = new Date();
+  await userModel.updateOne(
+    { _id: user._id },
+    { $set: { failed_login_attempts: 0, lockout_until: null, last_login_at: now } }
+  );
+  user.failed_login_attempts = 0;
+  user.lockout_until = null;
+  user.last_login_at = now;
+
+  const obj = user.toObject();
+  return stripSecrets(obj);
+}
+
+/** ปลดล็อกบัญชีด้วยมือ (แอดมิน) */
+export async function unlockUser(id: string) {
+  await dbConnect();
+  assertObjectId(id);
+  const user = await userModel
+    .findByIdAndUpdate(
+      id,
+      { $set: { failed_login_attempts: 0, lockout_until: null } },
+      { returnDocument: "after" }
+    )
+    .select(SELECT_PUBLIC)
+    .lean();
+  if (!user) throw notFound("ไม่พบผู้ใช้ที่ระบุ");
+  return user;
+}
+
+// ── ผูก / ยกเลิกผูกบัญชี LINE (แจ้งเตือนลูกค้า — src/lib/lineLogin.ts) ──
+/**
+ * เก็บ LINE userId ลงบัญชีนี้ · LINE เดียวผูกได้ทีละบัญชี — ถ้าเคยผูกกับบัญชีอื่นจะย้ายมาที่นี่
+ * (กันข้อความของอีกบัญชีเด้งเข้า LINE คนเดียวกันต่อ หลังเจ้าของ LINE เปลี่ยนมาใช้บัญชีใหม่)
+ */
+export async function linkLineAccount(id: string, lineUserId: string) {
+  await dbConnect();
+  assertObjectId(id);
+  await userModel.updateMany(
+    { line_user_id: lineUserId, _id: { $ne: id } },
+    { $set: { line_user_id: null } }
+  );
+  const user = await userModel
+    .findOneAndUpdate({ _id: id, deleted_at: null }, { $set: { line_user_id: lineUserId } }, { returnDocument: "after" })
+    .select(SELECT_PUBLIC)
+    .lean();
+  if (!user) throw notFound("ไม่พบผู้ใช้ที่ระบุ");
+  return user;
+}
+
+/**
+ * บัญชีที่สมัครด้วย LINE และไม่มีทางเข้าระบบอื่น (ไม่มีรหัสผ่าน · ไม่ได้ผูก Google) — line_user_id คือทางเข้าเดียว
+ * (oauthService.signInWithLine หาบัญชีจาก line_user_id) ยกเลิกผูกแล้วจะเข้าบัญชีไม่ได้อีก → ห้าม
+ * ตั้งรหัสผ่านก่อน (ลืมรหัสผ่าน → ลิงก์ในอีเมล) แล้วค่อยยกเลิกได้
+ */
+const LINE_ONLY_ACCOUNT = { auth_provider: "line", password: null, googleId: null };
+
+export async function unlinkLineAccount(id: string) {
+  await dbConnect();
+  assertObjectId(id);
+  // เงื่อนไขอยู่ใน filter เดียวกับ update — กันตั้ง/ลบรหัสผ่านพร้อมกันระหว่างตรวจ
+  const user = await userModel
+    .findOneAndUpdate(
+      { _id: id, deleted_at: null, $nor: [LINE_ONLY_ACCOUNT] },
+      { $set: { line_user_id: null } },
+      { returnDocument: "after" }
+    )
+    .select(SELECT_PUBLIC)
+    .lean();
+  if (!user) {
+    const exists = await userModel.exists({ _id: id, deleted_at: null });
+    if (!exists) throw notFound("ไม่พบผู้ใช้ที่ระบุ");
+    throw conflict(
+      "บัญชีนี้เข้าสู่ระบบด้วย LINE อย่างเดียว — ยกเลิกการผูกแล้วจะเข้าบัญชีไม่ได้ · ตั้งรหัสผ่านก่อน (ลืมรหัสผ่าน) แล้วค่อยยกเลิก"
+    );
+  }
+  return user;
+}

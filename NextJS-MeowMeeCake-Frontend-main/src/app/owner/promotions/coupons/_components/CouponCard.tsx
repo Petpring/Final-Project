@@ -1,0 +1,131 @@
+"use client";
+// การ์ดคูปอง 1 ใบ — โค้ด, มูลค่าส่วนลด, ความคืบหน้าการใช้, ขอบเขต, ช่องทาง, สถานะ
+import { useTranslations, useLocale } from "next-intl";
+import { BuildingStorefrontIcon, GlobeAltIcon } from "@heroicons/react/24/solid";
+import { ProgressBar, Switch, Tag } from "@/components/base";
+import { ConfirmDeletePopup } from "@/components/shared/feedback";
+import { formatCurrency, formatDate } from "@/i18n/format";
+import { DISCOUNT_TYPE_CONFIG, COUPON_STATUS_CONFIG } from "@/constants/enumConfig";
+import { EditButton, DeleteButton } from "@/components/shared/actions";
+import type { CouponRow } from "../useCouponsViewModel";
+import { usagePct } from "../couponForm";
+
+export function CouponCard({
+  coupon,
+  canUpdate,
+  canDelete,
+  onEdit,
+  onDelete,
+  onToggle,
+}: {
+  coupon: CouponRow;
+  canUpdate: boolean;
+  canDelete: boolean;
+  onEdit: (c: CouponRow) => void;
+  onDelete: (id: string) => void;
+  onToggle: (c: CouponRow) => void;
+}) {
+  const t = useTranslations();
+  const locale = useLocale();
+  const statusCfg = COUPON_STATUS_CONFIG[coupon.status];
+  const typeCfg = DISCOUNT_TYPE_CONFIG[coupon.discount_type];
+  const pct = usagePct(coupon);
+  const isExpired = coupon.status === "expired";
+
+  const discountLabel =
+    coupon.discount_type === "Percentage"
+      ? `${coupon.discount_value}%`
+      : coupon.discount_type === "Amount"
+        ? formatCurrency(coupon.discount_value, locale)
+        : t("coupons.freeShipping");
+
+  const scopeLabel =
+    coupon.applicable_products.length > 0
+      ? t("coupons.scopeProducts", { n: coupon.applicable_products.length })
+      : coupon.applicable_categories.length > 0
+        ? t("coupons.scopeCategories", { n: coupon.applicable_categories.length })
+        : t("coupons.scopeAll");
+
+  const minParts: string[] = [];
+  if (coupon.min_quantity) minParts.push(t("coupons.minQtyLabel", { n: coupon.min_quantity }));
+  if (coupon.min_order_amount) minParts.push(t("coupons.minOrderLabel", { amount: formatCurrency(coupon.min_order_amount, locale) }));
+  const minLabel = minParts.length > 0 ? minParts.join(" + ") : t("coupons.noMinimum");
+
+  return (
+    // หมดอายุ = พื้นเทา + มูลค่าส่วนลดสีเทา (เดิม opacity-60 ทั้งใบ → ตัวอักษรทุกตัวคอนทราสต์ไม่ถึง 4.5:1 · Lighthouse Accessibility ตก)
+    // h-full + flex-col: การ์ดยืดเต็มความสูงแถวของ grid แล้วแถบสถานะด้านล่างชิดล่างเสมอ (การ์ดในแถวเดียวกันสูงเท่ากัน)
+    <div className={`flex h-full flex-col overflow-hidden rounded-xl border border-gray-100 transition-all hover:border-gray-200 hover:shadow-md ${isExpired ? "bg-gray-50" : "bg-white"}`}>
+      <div className="flex flex-1">
+        <div className="w-1 shrink-0" style={{ background: statusCfg.color }} />
+
+        <div className="flex flex-1 flex-col p-3.5">
+          <div className="mb-2 flex items-start justify-between gap-2">
+            <div className="min-w-0 flex-1">
+              <p className="font-mono text-sm font-bold tracking-wider text-brown-800">{coupon.promotion_code}</p>
+              {/* ชื่อตัดที่ 2 บรรทัด + เผื่อที่ 2 บรรทัดเสมอ (แม้ชื่อสั้นหรือไม่มีชื่อ) ให้มูลค่าส่วนลดด้านล่างอยู่ระดับเดียวกันทุกใบ
+                  leading-5 แทนค่าเริ่มต้นของ text-xs — สระบน/ล่างของภาษาไทยไม่โดน line-clamp ตัด */}
+              <p className="mt-0.5 line-clamp-2 min-h-10 text-xs leading-5 text-gray-500" title={coupon.promotion_name || undefined}>
+                {coupon.promotion_name}
+              </p>
+            </div>
+            <div className="flex items-center gap-1">
+              {!isExpired && canUpdate && (
+                <EditButton type="text" size="small" onClick={() => onEdit(coupon)} />
+              )}
+              {canDelete && (
+                <ConfirmDeletePopup title={t("coupons.deleteConfirm", { code: coupon.promotion_code })} onConfirm={() => onDelete(coupon._id)}>
+                  <DeleteButton type="text" size="small" />
+                </ConfirmDeletePopup>
+              )}
+            </div>
+          </div>
+
+          <div className="mb-1">
+            <p className="text-2xl font-bold" style={{ color: isExpired ? "#4b5563" : typeCfg.color }}>{discountLabel}</p>
+            <p className="text-xs text-gray-500">
+              {t(`enums.discountType.${coupon.discount_type}`)}
+              {coupon.discount_type === "Percentage" && coupon.max_discount_amount != null &&
+                ` · ${t("coupons.maxDiscountLabel", { amount: formatCurrency(coupon.max_discount_amount, locale) })}`}
+            </p>
+          </div>
+
+          {coupon.usage_limit ? (
+            <div className="mb-2">
+              <div className="mb-1 flex items-center justify-between text-xs text-gray-500">
+                <span>{t("coupons.usageOf", { used: coupon.used_count, limit: coupon.usage_limit })}</span>
+                <span>{pct}%</span>
+              </div>
+              <ProgressBar percent={pct} color={typeCfg.color} ariaLabel={t("coupons.usageOf", { used: coupon.used_count, limit: coupon.usage_limit })} />
+            </div>
+          ) : (
+            <p className="mb-2 text-xs text-gray-500">{t("coupons.usageUnlimited", { used: coupon.used_count })}</p>
+          )}
+
+          {/* mt-auto: ช่วงวันที่/ขั้นต่ำชิดล่าง — ที่ว่างจากการยืดการ์ดไปอยู่เหนือบรรทัดนี้แทน */}
+          <div className="mt-auto flex flex-col gap-1 border-t border-gray-100 pt-2 text-xs text-gray-500">
+            <span>{formatDate(coupon.start_date, locale)} – {formatDate(coupon.end_date, locale)}</span>
+            <span>{minLabel} · {scopeLabel}</span>
+            <span>
+              {coupon.audience === "members" ? t("coupons.audienceMembers") : t("coupons.audienceAll")}
+              {coupon.stackable && ` · ${t("coupons.stackableLabel")}`}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div className="flex items-center justify-between border-t border-gray-100 bg-gray-50 px-3.5 py-2">
+        <div className="flex items-center gap-1">
+          <Tag color={statusCfg.antColor}>{t(`enums.couponStatus.${coupon.status}`)}</Tag>
+          {coupon.applicable_channels.includes("instore") && (
+            <Tag icon={<BuildingStorefrontIcon className="mr-1 inline h-3 w-3" />}>{t("coupons.channelInstore")}</Tag>
+          )}
+          {coupon.applicable_channels.includes("online") && (
+            <Tag icon={<GlobeAltIcon className="mr-1 inline h-3 w-3" />}>{t("coupons.channelOnline")}</Tag>
+          )}
+        </div>
+        <Switch checked={coupon.is_active} disabled={isExpired || !canUpdate} onChange={() => onToggle(coupon)} aria-label={coupon.promotion_code} />
+      </div>
+    </div>
+  );
+}
+

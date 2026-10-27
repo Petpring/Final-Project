@@ -1,0 +1,170 @@
+"use client";
+// สร้างใบสั่งผลิต — antd Modal + base/Form · รายการสินค้าเป็นแถวไดนามิก (state ในตัว คล้าย
+// IngredientFormModal/StockActionModal — ยังไม่ซับซ้อนพอต้องแยก ViewModel ของตัวเอง)
+// รายการสินค้าที่เลือกได้ = เฉพาะที่มีสูตรผูกแล้ว (backend บังคับ recipe_id ต่อแถว — กรองไว้แล้วที่
+// useProductionViewModel.productOptions) ไม่เช็ควัตถุดิบขาด/พอที่นี่ (backend เช็คตอนปิดงานผลิตแทน)
+import { Modal } from "antd";
+import { useTranslations } from "next-intl";
+import dayjs, { type Dayjs } from "dayjs";
+import { Form, FormItem, useAntForm, Input, TextArea, InputNumber, Select, DatePicker, Button } from "@/components/base";
+import { alert } from "@/lib/alert";
+import type { CreateProductionOrderItemInput } from "@/types/productionOrder";
+import { actionIcon, modalButtonIcons } from "@/components/shared/actions";
+import type { CreateProductionOrderValue } from "../useProductionViewModel";
+import { useEditableRows, RemoveRowButton } from "@/components/shared/form";
+import { sortOptionsThai } from "@/lib/thaiSort";
+
+interface ProductOption { _id: string; name: string; unit_abbr: string; recipe_id: string }
+interface StaffOption { _id: string; user_fullname: string }
+
+interface ItemRow {
+  key: string;
+  product_id: string;
+  planned_qty: number;
+  notes: string;
+}
+
+function emptyRow(): ItemRow {
+  return { key: crypto.randomUUID(), product_id: "", planned_qty: 1, notes: "" };
+}
+
+interface FormValues {
+  production_date: Dayjs;
+  assigned_to?: string;
+  production_note?: string;
+}
+
+export function ProductionOrderFormModal({
+  open,
+  products,
+  staff,
+  saving,
+  onClose,
+  onSubmit,
+}: {
+  open: boolean;
+  products: ProductOption[];
+  staff: StaffOption[];
+  saving: boolean;
+  onClose: () => void;
+  onSubmit: (v: CreateProductionOrderValue) => void;
+}) {
+  const t = useTranslations();
+  const [form] = useAntForm<FormValues>();
+  const { rows, setRows, updateRow, removeRow } = useEditableRows<ItemRow>([emptyRow()]);
+
+  /** เคลียร์ฟอร์ม+แถวหลังปิด modal สนิทแล้ว (ไม่ว่าจะปิดจากปุ่มยกเลิกหรือหลังบันทึกสำเร็จ)
+   *  ใช้ callback ของ antd แทน useEffect(open) — เลี่ยง setState ใน effect (react-compiler) */
+  const handleAfterClose = () => {
+    form.resetFields();
+    setRows([emptyRow()]);
+  };
+
+  const handleOk = async () => {
+    const v = await form.validateFields();
+    const validRows = rows.filter((r) => r.product_id && r.planned_qty > 0);
+    if (validRows.length === 0) {
+      alert.warning(t("production.itemsRequired"));
+      return;
+    }
+    const items: CreateProductionOrderItemInput[] = validRows.map((r) => {
+      const p = products.find((pr) => pr._id === r.product_id)!;
+      return { product_id: p._id, recipe_id: p.recipe_id, planned_qty: r.planned_qty, notes: r.notes || null };
+    });
+    onSubmit({
+      production_date: v.production_date.toISOString(),
+      assigned_to: v.assigned_to ?? null,
+      production_note: v.production_note?.trim() || null,
+      items,
+    });
+  };
+
+  return (
+    <Modal
+      open={open}
+      title={t("production.createTitle")}
+      onCancel={onClose}
+      onOk={handleOk}
+      confirmLoading={saving}
+      {...modalButtonIcons("add")}
+      okText={t("production.createSubmit")}
+      cancelText={t("common.cancel")}
+      width={640}
+      destroyOnHidden
+      afterClose={handleAfterClose}
+    >
+      <Form form={form} layout="vertical" initialValues={{ production_date: dayjs() }}>
+        <div className="grid grid-cols-2 gap-3">
+          <FormItem
+            name="production_date"
+            label={t("production.fieldDate")}
+            rules={[{ required: true, message: t("validation.required") }]}
+          >
+            <DatePicker format="DD/MM/YYYY" />
+          </FormItem>
+          <FormItem name="assigned_to" label={t("production.fieldAssignee")}>
+            <Select
+              allowClear
+              placeholder={t("production.assigneePlaceholder")}
+              options={sortOptionsThai(staff.map((s) => ({ value: s._id, label: s.user_fullname })))}
+            />
+          </FormItem>
+        </div>
+        <FormItem name="production_note" label={t("production.fieldNote")}>
+          <TextArea rows={1} placeholder={t("production.notePlaceholder")} />
+        </FormItem>
+
+        <div className="flex items-center justify-between mb-2">
+          <p className="text-sm font-semibold text-gray-500">{t("production.itemsTitle", { n: rows.length })}</p>
+          <Button size="small" icon={actionIcon("add", "small")} onClick={() => setRows((p) => [...p, emptyRow()])}>
+            {t("production.addItem")}
+          </Button>
+        </div>
+
+        {rows.length > 0 && (
+          <div className="mb-1 grid gap-2 text-xs text-gray-500" style={{ gridTemplateColumns: "1fr 90px 1fr 24px" }}>
+            <span>{t("filterLabel.product")}</span>
+            <span>{t("filterLabel.quantity")}</span>
+            <span>{t("filterLabel.note")}</span>
+            <span />
+          </div>
+        )}
+        {rows.map((row) => (
+          <div key={row.key} className="grid gap-2 mb-2 items-center" style={{ gridTemplateColumns: "1fr 90px 1fr 24px" }}>
+            <Select
+              size="small"
+              aria-label={t("filterLabel.product")}
+              placeholder={t("production.selectProduct")}
+              value={row.product_id || undefined}
+              onChange={(v) => updateRow(row.key, { product_id: v as string })}
+              showSearch
+              optionFilterProp="label"
+              options={sortOptionsThai(products.map((p) => ({
+                value: p._id,
+                label: p.name,
+                disabled: rows.some((r) => r.key !== row.key && r.product_id === p._id),
+              })))}
+            />
+            <InputNumber
+              size="small"
+              className="!w-full"
+              min={1}
+              aria-label={t("filterLabel.quantity")}
+              value={row.planned_qty}
+              onChange={(v) => updateRow(row.key, { planned_qty: Number(v) || 1 })}
+              suffix={<span className="text-xs text-gray-500">{products.find((p) => p._id === row.product_id)?.unit_abbr ?? ""}</span>}
+            />
+            <Input
+              size="small"
+              aria-label={t("filterLabel.note")}
+              value={row.notes}
+              onChange={(e) => updateRow(row.key, { notes: e.target.value })}
+              placeholder={t("production.itemNotePlaceholder")}
+            />
+            <RemoveRowButton onClick={() => removeRow(row.key)} disabled={rows.length === 1} />
+          </div>
+        ))}
+      </Form>
+    </Modal>
+  );
+}

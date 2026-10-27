@@ -1,0 +1,190 @@
+"use client";
+// View ของ Employees List — JSX ล้วน (+ ResetPasswordModal สำหรับตั้งรหัสผ่านใหม่)
+import dynamic from "next/dynamic";
+import { useOpenedOnce } from "@/hooks/useOpenedOnce";
+import { useTranslations, useLocale } from "next-intl";
+import { KeyIcon, LockOpenIcon } from "@heroicons/react/24/outline";
+import { formatDate } from "@/i18n/format";
+import { Avatar, Button, Select, Tag } from "@/components/base";
+import { ListPageLayout } from "@/components/shared/layout";
+import { StatCard, StatCardsGrid } from "@/components/shared/stats";
+import { ConfirmDeletePopup, LoadFailed } from "@/components/shared/feedback";
+import { DataTable, FilterToolbar, SearchInput, type Column, FilterField } from "@/components/shared/data";
+import { DeleteButton, EditButton, actionIcon } from "@/components/shared/actions";
+import type { EmployeeRow, useEmployeesViewModel } from "./useEmployeesViewModel";
+import { EMPLOYEE_WORKING_CONFIG, NOTICE_TAG } from "@/constants/enumConfig";
+import { sortOptionsThai } from "@/lib/thaiSort";
+import { RestoreDeletedButton } from "@/components/shared/restore";
+
+// โมดัลตั้งรหัสผ่านใหม่แยก chunk — โหลดเมื่อเปิดครั้งแรก (โมดัลไม่ render ฝั่ง server อยู่แล้ว)
+const ResetPasswordModal = dynamic(() => import("./_components/ResetPasswordModal").then((m) => m.ResetPasswordModal), { ssr: false });
+
+type VM = ReturnType<typeof useEmployeesViewModel>;
+
+export function EmployeesView(vm: VM) {
+  const t = useTranslations();
+  const passwordUsed = useOpenedOnce(!!vm.passwordTarget);
+  const locale = useLocale();
+
+  const columns: Column<EmployeeRow>[] = [
+    {
+      key: "name",
+      title: t("employees.colName"),
+      render: (r) => (
+        <div className="flex items-center gap-2">
+          <Avatar name={r.name} size={28} />
+          <span className="font-medium text-brown-800">{r.name}</span>
+        </div>
+      ),
+    },
+    { key: "role", title: t("employees.colRole"), render: (r) => <Tag color={NOTICE_TAG.roleName}>{r.roleName}</Tag> },
+    {
+      key: "type",
+      title: t("employees.colType"),
+      // ข้อมูลเก่าบางแถวมีค่านอก enum ที่ schema กำหนด (เช่น "Active" — ดู docs/BACKLOG.md §2)
+      // กัน MISSING_MESSAGE ด้วย t.has() เหมือนแพทเทิร์นเดียวกันที่ userLog/UserLogView.tsx ใช้
+      render: (r) =>
+        r.employmentType
+          ? t.has(`enums.employmentType.${r.employmentType}`)
+            ? t(`enums.employmentType.${r.employmentType}`)
+            : t("enums.employmentType.fallback")
+          : "—",
+    },
+    { key: "phone", title: t("employees.colPhone"), render: (r) => r.phone },
+    {
+      key: "status",
+      title: t("employees.colStatus"),
+      render: (r) => (
+        <div className="flex flex-wrap items-center gap-1">
+          <Tag color={EMPLOYEE_WORKING_CONFIG[r.working ? "working" : "left"].antColor} className="!m-0">
+            {r.working ? t("employees.statusWorking") : t("employees.statusLeft")}
+          </Tag>
+          {r.locked && r.lockedUntil && (
+            <Tag
+              color={NOTICE_TAG.cancelled}
+              className="!m-0"
+              title={t("employees.lockedUntil", { time: formatDate(r.lockedUntil, locale, { withTime: true }) })}
+            >
+              {t("employees.statusLocked")}
+            </Tag>
+          )}
+        </div>
+      ),
+    },
+  ];
+
+  return (
+    <ListPageLayout
+      title={t("employees.title")}
+      actions={
+        <>
+          <RestoreDeletedButton menu="employees" resources={["staff"]} />
+          {vm.perm.create && (
+            <Button type="primary" icon={actionIcon("add")} href="/owner/employees/addEmployee">
+              {t("employees.addEmployee")}
+            </Button>
+          )}
+        </>
+      }
+      toolbar={
+        <FilterToolbar
+          left={<SearchInput value={vm.search} onChange={vm.setSearch} placeholder={t("employees.searchPlaceholder")} />}
+          // ตัวกรองชิดขวา: ตำแหน่ง → สถานะ
+          right={
+            <>
+              <FilterField label={t("filterLabel.role")} minWidth={160}>
+                <Select
+                  value={vm.roleId}
+                  onChange={(v) => vm.setRoleId(v as string)}
+                  options={[
+                    { value: "all", label: t("employees.allRoles") },
+                    ...sortOptionsThai(vm.staffRoles.map((r) => ({ value: r._id, label: r.role_name }))),
+                  ]}
+                />
+              </FilterField>
+              <FilterField label={t("filterLabel.status")} minWidth={140}>
+                <Select
+                  value={vm.status}
+                  onChange={(v) => vm.setStatus(v as VM["status"])}
+                  options={[
+                    { value: "all", label: t("common.all") },
+                    { value: "working", label: t("employees.statusWorking") },
+                    { value: "left", label: t("employees.statusLeft") },
+                  ]}
+                />
+              </FilterField>
+            </>
+          }
+        />
+      }
+    >
+      {vm.isError ? (
+        <LoadFailed onRetry={vm.refetch} />
+      ) : (
+        <div className="flex flex-col gap-5">
+          <StatCardsGrid>
+            <StatCard label={t("employees.statTotal")} value={vm.stats.total} sub={t("employees.statTotalSub")} />
+            <StatCard label={t("employees.statWorking")} value={vm.stats.working} sub={t("employees.statWorkingSub")} tone="up" />
+            <StatCard label={t("employees.statLeft")} value={vm.stats.left} sub={t("employees.statLeftSub")} tone="warn" />
+            <StatCard label={t("employees.statRoles")} value={vm.stats.roles} sub={t("employees.statRolesSub")} />
+          </StatCardsGrid>
+
+          <DataTable
+            columns={columns}
+            rows={vm.rows}
+            loading={vm.isLoading}
+            emptyText={t("employees.empty")}
+            actions={
+              vm.perm.update || vm.perm.delete
+                ? (r) =>
+                    vm.canManage(r) && (
+                    <div className="flex justify-end gap-2">
+                      {vm.perm.update && r.locked && (
+                        <Button
+                          size="small"
+                          icon={<LockOpenIcon className="h-3.5 w-3.5" />}
+                          loading={vm.unlockingId === r._id}
+                          onClick={() => vm.onUnlock(r)}
+                        >
+                          {t("employees.unlock")}
+                        </Button>
+                      )}
+                      {vm.perm.update && (
+                        <Button
+                          size="small"
+                          icon={<KeyIcon className="h-3.5 w-3.5" />}
+                          onClick={() => vm.openPassword(r)}
+                        >
+                          {t("employees.resetPassword")}
+                        </Button>
+                      )}
+                      {vm.perm.update && (
+                        <EditButton size="small" href={`/owner/employees/editEmployee?id=${r._id}`} />
+                      )}
+                      {vm.perm.delete && (
+                        <ConfirmDeletePopup
+                          title={t("employees.deleteConfirm", { name: r.name })}
+                          onConfirm={() => vm.onDelete(r._id)}
+                        >
+                          <DeleteButton size="small" />
+                        </ConfirmDeletePopup>
+                      )}
+                    </div>
+                  )
+                : undefined
+            }
+          />
+        </div>
+      )}
+
+      {passwordUsed && (
+        <ResetPasswordModal
+          target={vm.passwordTarget}
+          saving={vm.savingPassword}
+          onClose={vm.closePassword}
+          onSave={vm.onSavePassword}
+        />
+      )}
+    </ListPageLayout>
+  );
+}

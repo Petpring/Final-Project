@@ -1,0 +1,573 @@
+/**
+ * productionOrderService — ใบสั่งผลิต (ProductionOrders) + รายการผลิต (ผ่าน productionItemService)
+ *
+ * สร้างได้ 2 ทาง:
+ *  - createProductionOrder    : สร้างเอง (source_type บังคับเป็น "manual" เสมอ ไม่ผูก round_id)
+ *  - createProductionFromRound: สร้างจากรอบพรีออเดอร์ที่ "ปิดรับแล้ว" (source_type = "preorder",
+ *    round_id ผูกไว้) — รวมยอดสั่งจริงต่อสินค้าจากพรีออเดอร์ที่ยังไม่ยกเลิกในรอบนั้นให้อัตโนมัติ
+ *    สร้างได้แค่ 1 ใบต่อรอบ (ยกเลิกใบเดิมก่อนถ้าต้องการสร้างใหม่)
+ *
+ * flow: planned → in_progress → done   (ยกเลิกได้ทุกสถานะที่ยังไม่ done → cancelled)
+ *  - startProduction   : planned → in_progress, เซ็ต started_at
+ *  - completeProduction: in_progress → done, หักสต็อกวัตถุดิบของรายการที่ยังไม่ถูกหักให้ครบ
+ *                        + เพิ่มสต็อกสินค้าสำเร็จรูปของสินค้าปกติ (BACKLOG4 Y2)
+ *  - cancelProduction  : → cancelled, คืนสต็อกของรายการที่หักไปแล้ว
+ */
+import dbConnect from "../lib/dbConnect";
+import { badRequest, conflict, notFound } from "../lib/httpError";
+import { assertObjectId } from "../lib/objectId";
+import { assertRefExists } from "../lib/refs";
+import { Saga } from "../lib/compensation";
+import { generateDocNo, isPreorderProduct } from "../lib/productCode";
+import { buildMeta, escapeRegExp, type Pagination } from "../lib/queryParams";
+import productionOrderModel from "../models/productionOrderModel";
+import productionItemModel from "../models/productionItemModel";
+import userModel from "../models/userModel";
+import preorderRoundModel from "../models/preorderRoundModel";
+import preorderModel from "../models/preorderModel";
+import preorderItemModel from "../models/preorderItemModel";
+import recipeModel from "../models/recipeModel";
+import productModel from "../models/productModel";
+import * as productionItemService from "./productionItemService";
+import * as productService from "./productService";
+import type { AddItemInput } from "./productionItemService";
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+
+export const PRODUCTION_STATUSES = ["planned", "in_progress", "done", "cancelled"] as const;
+export type ProductionStatus = (typeof PRODUCTION_STATUSES)[number];
+
+const NEXT_STATUS: Record<ProductionStatus, ProductionStatus[]> = {
+  planned: ["in_progress", "cancelled"],
+  in_progress: ["done", "cancelled"],
+  done: [],
+  cancelled: [],
+};
+
+export interface CreateProductionOrderInput {
+  production_date: string | Date;
+  source_type?: "manual";
+  assigned_to?: string | null;
+  production_note?: string | null;
+  items?: AddItemInput[];
+}
+
+export interface ListProductionOrderQuery {
+  pagination: Pagination;
+  production_status?: ProductionStatus;
+  source_type?: "manual" | "preorder";
+  round_id?: string;
+  assigned_to?: string;
+  search?: string;
+  date_from?: string;
+  date_to?: string;
+  includeDeleted?: boolean;
+}
+
+export interface CreateProductionFromRoundInput {
+  round_id: string;
+  production_date: string | Date;
+  assigned_to?: string | null;
+  production_note?: string | null;
+}
+
+// ── CREATE ─────────────────────────────────────────────────
+export async function createProductionOrder(input: CreateProductionOrderInput) {
+  await dbConnect();
+
+  if (!input.production_date) throw badRequest("กรุณาระบุ production_date");
+  if (input.source_type && input.source_type !== "manual") {
+    throw badRequest('เฟสนี้รองรับ source_type = "manual" เท่านั้น (preorder อยู่ในเฟสถัดไป)');
+  }
+  if (input.assigned_to) {
+    await assertRefExists(userModel, input.assigned_to, "ผู้รับผิดชอบ", "assigned_to");
+  }
+
+  let order: any = null;
+  for (let attempt = 0; attempt < 5 && !order; attempt++) {
+    try {
+      order = await productionOrderModel.create({
+        production_no: generateDocNo("PRD", 5),
+        production_date: new Date(input.production_date),
+        source_type: "manual",
+        production_status: "planned",
+        assigned_to: input.assigned_to ?? null,
+        production_note: input.production_note ?? null,
+      });
+    } catch (err: any) {
+      if (err?.code === 11000 && attempt < 4) continue;
+      throw err;
+    }
+  }
+
+  if (Array.isArray(input.items) && input.items.length) {
+    // BACKLOG2 §2.2 — เดิมวน await addItem() ทีละรายการ (แต่ละครั้ง fetch order ซ้ำ + query
+    // product/recipe แยก) เปลี่ยนมา addItems() (พหูพจน์) แบบ batch ครั้งเดียว
+    //
+    // BACKLOG2 §10 — ไล่เทียบกับ orderService.persistOrder()/preorderService.createPreorder() (ทั้งคู่
+    // ห่อขั้น "สร้าง header แล้วค่อยสร้าง child items" ด้วย Saga) พบว่าที่นี่ไม่มี — ถ้า addItems()
+    // throw (เช่น recipe_id ที่ระบุไม่ตรงกับ product_id ของรายการนั้น เป็น validation ที่เกิด*หลัง*
+    // สร้าง header ไปแล้ว ต่างจาก preorderRoundService.createRound() ที่ validate items ให้ครบ*ก่อน*
+    // สร้าง header) จะเหลือใบสั่งผลิต "planned" ที่ไม่มีรายการค้างอยู่ใน DB ตลอดไป ไม่มีทาง rollback —
+    // ใช้ Saga แบบเดียวกับ order/preorder ปิดช่องนี้
+    const saga = new Saga();
+    saga.onRollback("delete-production-order", () =>
+      productionOrderModel.deleteOne({ _id: order._id })
+    );
+    try {
+      await productionItemService.addItems(String(order._id), input.items);
+      saga.commit();
+    } catch (err) {
+      await saga.rollback();
+      throw err;
+    }
+  }
+
+  return getProductionOrderById(String(order._id));
+}
+
+/**
+ * รวมยอดสั่งต่อสินค้าของรอบ — เฉพาะพรีออเดอร์ที่ยังไม่ถูกลบ/ยกเลิก · paid=true นับเฉพาะ "ยืนยันการชำระเงินแล้ว"
+ * paid=false นับเฉพาะที่ยังไม่จ่าย (ให้ preview บอกว่ามีอะไรไม่ถูกนับ) · ใช้ร่วมกันระหว่างสร้างจริงกับ preview
+ * docs/preorder-round-flow.md ประเด็น 3 (ตัดสินใจ 2026-10-01) — เดิมนับทุกรายการรวมที่ยังไม่จ่าย → ผลิตให้คนไม่จ่าย
+ * รายการที่จ่ายทีหลัง (เช่น สลิปรอตรวจตอนปิดรอบ) บวกเข้าใบผลิตให้ที่ preorderRoundLifecycleService.onPreorderPaid
+ */
+async function roundDemand(
+  roundId: unknown,
+  paid: boolean
+): Promise<Array<{ _id: unknown; round_item_id: unknown; qty: number; preorder_ids: unknown[] }>> {
+  return preorderItemModel.aggregate([
+    {
+      $lookup: {
+        from: preorderModel.collection.name,
+        localField: "preorder_id",
+        foreignField: "_id",
+        as: "preorder",
+      },
+    },
+    { $unwind: "$preorder" },
+    {
+      $match: {
+        "preorder.round_id": roundId,
+        "preorder.deleted_at": null,
+        "preorder.order_status": { $ne: "cancelled" },
+        "preorder.payment_status": paid ? "paid" : { $ne: "paid" },
+      },
+    },
+    {
+      $group: {
+        _id: "$product_id",
+        round_item_id: { $first: "$round_item_id" },
+        qty: { $sum: "$quantity" },
+        preorder_ids: { $addToSet: "$preorder_id" },
+      },
+    },
+  ]);
+}
+
+/**
+ * สูตรล่าสุดต่อสินค้า — เรียงใหม่→เก่า แล้วเอาตัวแรก คล้าย recipeService.getUnitCostByProduct() แต่เพิ่ม
+ * _id เป็น tie-breaker ด้วย (created_at ละเอียดแค่ระดับมิลลิวินาที ถ้าสร้าง 2 สูตรในมิลลิวินาทีเดียวกัน
+ * Mongo ไม่การันตีลำดับผลลัพธ์ที่ค่าเท่ากัน — ยืนยันจริงจากเทสที่เพิ่มใหม่ ObjectId มีตัวนับเพิ่มขึ้นเสมอ
+ * ต่อการสร้างในโปรเซสเดียวกัน จึงเรียงได้ deterministic เสมอ) กันกรณีสินค้าหนึ่งมีสูตรที่ยังไม่ถูกลบ
+ * มากกว่า 1 สูตร (เดิมไม่มี .sort() เลย ทำให้ผลลัพธ์ไม่แน่นอนขึ้นกับ Mongo ไม่ใช่เจตนา — docs/BACKLOG2.md §12.2)
+ */
+async function latestRecipeByProduct(productIds: string[]): Promise<Map<string, any>> {
+  const recipes = await recipeModel
+    .find({ product_id: { $in: productIds }, deleted_at: null })
+    .sort({ created_at: -1, _id: -1 })
+    .lean<any[]>();
+  const recipeByProduct = new Map<string, any>();
+  for (const r of recipes) {
+    if (!recipeByProduct.has(String(r.product_id))) recipeByProduct.set(String(r.product_id), r);
+  }
+  return recipeByProduct;
+}
+
+export type FromRoundBlocker = "round_not_closed" | "already_has_production" | "no_paid_orders" | "missing_recipe";
+
+/**
+ * ดูล่วงหน้าก่อนสร้างใบสั่งผลิตจากรอบ — ใช้ roundDemand/latestRecipeByProduct ชุดเดียวกับ
+ * createProductionFromRound ตัวเลขจึงตรงกับที่จะสร้างจริง · blockers = เหตุที่ createProductionFromRound
+ * จะปฏิเสธ (ว่าง = สร้างได้) · unpaid = ยอดที่ยังไม่จ่าย จะไม่ถูกนับ (จ่ายทีหลังค่อยบวกเข้าใบเอง)
+ */
+export async function previewProductionFromRound(roundId: string) {
+  await dbConnect();
+  assertObjectId(roundId, "round_id");
+
+  const round = await preorderRoundModel
+    .findOne({ _id: roundId, deleted_at: null })
+    .select("round_name pickup_date round_status")
+    .lean<any>();
+  if (!round) throw notFound("ไม่พบรอบพรีออเดอร์ที่ระบุ");
+
+  const [existing, paid, unpaid] = await Promise.all([
+    productionOrderModel
+      .findOne({ round_id: round._id, deleted_at: null, production_status: { $ne: "cancelled" } })
+      .select("production_no production_status")
+      .lean<any>(),
+    roundDemand(round._id, true),
+    roundDemand(round._id, false),
+  ]);
+
+  const productIds = [...new Set([...paid, ...unpaid].map((g) => String(g._id)))];
+  const [recipeByProduct, products] = await Promise.all([
+    latestRecipeByProduct(productIds),
+    productModel.find({ _id: { $in: productIds } }).select("product_name_th").lean<any[]>(),
+  ]);
+  const nameById = new Map(products.map((p) => [String(p._id), p.product_name_th as string]));
+  const unpaidByProduct = new Map(unpaid.map((g) => [String(g._id), g.qty]));
+
+  const lines = productIds
+    .map((id) => {
+      const recipe = recipeByProduct.get(id);
+      return {
+        product_id: id,
+        product_name_th: nameById.get(id) ?? "-",
+        planned_qty: paid.find((g) => String(g._id) === id)?.qty ?? 0,
+        unpaid_qty: unpaidByProduct.get(id) ?? 0,
+        recipe: recipe ? { _id: String(recipe._id), recipe_name: recipe.recipe_name as string } : null,
+      };
+    })
+    .sort((a, b) => b.planned_qty - a.planned_qty || a.product_name_th.localeCompare(b.product_name_th, "th"));
+
+  const blockers: FromRoundBlocker[] = [];
+  if (round.round_status !== "closed") blockers.push("round_not_closed");
+  if (existing) blockers.push("already_has_production");
+  if (!paid.length) blockers.push("no_paid_orders");
+  // สินค้าที่ยังไม่มีคนจ่าย ไม่เข้าใบผลิต — ไม่มีสูตรก็ไม่ขวาง
+  if (lines.some((l) => l.planned_qty > 0 && !l.recipe)) blockers.push("missing_recipe");
+
+  const count = (groups: { preorder_ids: unknown[] }[]) => new Set(groups.flatMap((g) => g.preorder_ids.map(String))).size;
+  return {
+    round: { _id: String(round._id), round_name: round.round_name, pickup_date: round.pickup_date, round_status: round.round_status },
+    existing_production: existing
+      ? { _id: String(existing._id), production_no: existing.production_no, production_status: existing.production_status }
+      : null,
+    products: lines,
+    paid_order_count: count(paid),
+    unpaid_order_count: count(unpaid),
+    blockers,
+  };
+}
+
+/**
+ * สร้างใบสั่งผลิตจาก "รอบพรีออเดอร์" ที่ปิดรับแล้ว — รวมยอดสั่งจริงต่อสินค้าจากพรีออเดอร์ที่ยังไม่
+ * ยกเลิกทั้งหมดในรอบนั้น (join preorderItems → preorders ด้วย round_id) แล้วสร้างเป็น production
+ * item 1 แถวต่อสินค้า (planned_qty = ผลรวมจำนวนที่ลูกค้าสั่ง) ผูก round_item_id ไว้ด้วยเพื่อย้อนดูที่มา
+ *
+ * บังคับ round_status = "closed" เท่านั้น (ยอดสั่งยังไม่นิ่งตอน scheduled/open) และให้สร้างได้แค่ 1 ใบ
+ * ต่อรอบ (กันสร้างซ้ำ/สับสนว่าใบไหนคือของจริง) — ยกเลิกใบเดิมได้ถ้าต้องการสร้างใหม่
+ */
+export async function createProductionFromRound(input: CreateProductionFromRoundInput) {
+  await dbConnect();
+  assertObjectId(input.round_id, "round_id");
+  if (!input.production_date) throw badRequest("กรุณาระบุ production_date");
+
+  const round = await preorderRoundModel.findOne({ _id: input.round_id, deleted_at: null }).lean<any>();
+  if (!round) throw notFound("ไม่พบรอบพรีออเดอร์ที่ระบุ");
+  if (round.round_status !== "closed") {
+    throw conflict('สร้างใบสั่งผลิตได้เฉพาะรอบที่สถานะ "ปิดรับแล้ว" เท่านั้น (ยอดสั่งของรอบที่ยังไม่ปิดยังไม่นิ่ง)');
+  }
+
+  const existing = await productionOrderModel.countDocuments({
+    round_id: round._id,
+    deleted_at: null,
+    production_status: { $ne: "cancelled" },
+  });
+  if (existing > 0) throw conflict("มีใบสั่งผลิตสำหรับรอบนี้อยู่แล้ว (ยกเลิกใบเดิมก่อนถ้าต้องการสร้างใหม่)");
+
+  if (input.assigned_to) {
+    await assertRefExists(userModel, input.assigned_to, "ผู้รับผิดชอบ", "assigned_to");
+  }
+
+  const grouped = await roundDemand(round._id, true);
+  if (!grouped.length) throw badRequest("รอบนี้ยังไม่มีพรีออเดอร์ที่ชำระเงินแล้ว (นับเฉพาะรายการที่ยืนยันการชำระเงิน)");
+
+  const productIds = grouped.map((g) => String(g._id));
+  const recipeByProduct = await latestRecipeByProduct(productIds);
+  const missing = productIds.filter((id) => !recipeByProduct.has(id));
+  if (missing.length) {
+    throw badRequest(`มีสินค้า ${missing.length} รายการในรอบนี้ที่ยังไม่มีสูตรผูกไว้ — ผูกสูตรให้ครบก่อนสร้างใบสั่งผลิต`);
+  }
+
+  let order: any = null;
+  for (let attempt = 0; attempt < 5 && !order; attempt++) {
+    try {
+      order = await productionOrderModel.create({
+        production_no: generateDocNo("PRD", 5),
+        production_date: new Date(input.production_date),
+        source_type: "preorder",
+        round_id: round._id,
+        production_status: "planned",
+        assigned_to: input.assigned_to ?? null,
+        production_note: input.production_note ?? null,
+      });
+    } catch (err: any) {
+      if (err?.code === 11000 && attempt < 4) continue;
+      throw err;
+    }
+  }
+
+  const saga = new Saga();
+  saga.onRollback("delete-production-order", () => productionOrderModel.deleteOne({ _id: order._id }));
+  try {
+    const inputs: AddItemInput[] = grouped.map((g) => ({
+      product_id: String(g._id),
+      recipe_id: String(recipeByProduct.get(String(g._id))._id),
+      planned_qty: g.qty,
+      round_item_id: g.round_item_id ? String(g.round_item_id) : null,
+    }));
+    await productionItemService.addItems(String(order._id), inputs);
+    saga.commit();
+  } catch (err) {
+    await saga.rollback();
+    throw err;
+  }
+
+  return getProductionOrderById(String(order._id));
+}
+
+// ── READ ───────────────────────────────────────────────────
+export async function listProductionOrders(query: ListProductionOrderQuery) {
+  await dbConnect();
+
+  const filter: Record<string, any> = {};
+  if (!query.includeDeleted) filter.deleted_at = null;
+  if (query.production_status) filter.production_status = query.production_status;
+  if (query.source_type) filter.source_type = query.source_type;
+  if (query.round_id) {
+    assertObjectId(query.round_id, "round_id");
+    filter.round_id = query.round_id;
+  }
+  if (query.assigned_to) {
+    assertObjectId(query.assigned_to, "assigned_to");
+    filter.assigned_to = query.assigned_to;
+  }
+  if (query.search) filter.production_no = new RegExp(escapeRegExp(query.search.trim()), "i");
+  if (query.date_from || query.date_to) {
+    filter.production_date = {};
+    if (query.date_from) filter.production_date.$gte = new Date(query.date_from);
+    if (query.date_to) filter.production_date.$lte = new Date(query.date_to);
+  }
+
+  const [items, total] = await Promise.all([
+    productionOrderModel
+      .find(filter)
+      .sort({ production_date: -1, created_at: -1 })
+      .skip(query.pagination.skip)
+      .limit(query.pagination.limit)
+      .populate("assigned_to", "user_fullname email")
+      .populate("round_id", "round_name pickup_date round_status")
+      .lean(),
+    productionOrderModel.countDocuments(filter),
+  ]);
+
+  // แนบ items[] ให้ทุกใบ (query เดียว) — หน้าจัดการการผลิตใช้ข้อมูลจากรายการนี้ทั้ง drawer รายละเอียด
+  // ฟอร์มปิดงาน (กรอกจำนวนที่ผลิตได้จริง) และสรุปประวัติการผลิต · เดิมมีเฉพาะ GET รายตัว
+  const itemsByOrder = await productionItemService.listByOrders(items.map((o) => String(o._id)));
+  return {
+    items: items.map((o) => ({ ...o, items: itemsByOrder.get(String(o._id)) ?? [] })),
+    meta: buildMeta(total, query.pagination),
+  };
+}
+
+export async function getProductionOrderById(id: string, opts: { includeDeleted?: boolean } = {}) {
+  await dbConnect();
+  assertObjectId(id);
+
+  const filter: Record<string, any> = { _id: id };
+  if (!opts.includeDeleted) filter.deleted_at = null;
+
+  const order = await productionOrderModel
+    .findOne(filter)
+    .populate("assigned_to", "user_fullname email")
+    .populate("round_id", "round_name pickup_date round_status")
+    .lean<any>();
+  if (!order) throw notFound("ไม่พบใบสั่งผลิตที่ระบุ");
+
+  const items = await productionItemService.listByOrder(String(order._id));
+  return { ...order, items };
+}
+
+// ── UPDATE (ข้อมูลหัวใบ) ───────────────────────────────────
+export async function updateProductionOrder(id: string, input: Record<string, any>) {
+  await dbConnect();
+  assertObjectId(id);
+
+  const order = await productionOrderModel.findOne({ _id: id, deleted_at: null });
+  if (!order) throw notFound("ไม่พบใบสั่งผลิตที่ระบุ");
+  if (["done", "cancelled"].includes(order.production_status)) {
+    throw conflict("ใบสั่งผลิตที่ปิดแล้วแก้ไขไม่ได้");
+  }
+
+  if (input.assigned_to) {
+    await assertRefExists(userModel, input.assigned_to, "ผู้รับผิดชอบ", "assigned_to");
+  }
+  for (const f of ["production_date", "assigned_to", "production_note"] as const) {
+    if (input[f] !== undefined) {
+      (order as any)[f] = f === "production_date" ? new Date(input[f]) : input[f];
+    }
+  }
+  await order.save();
+  return getProductionOrderById(id);
+}
+
+// ── STATUS ─────────────────────────────────────────────────
+async function transition(id: string, next: ProductionStatus): Promise<any> {
+  const order = await productionOrderModel.findOne({ _id: id, deleted_at: null });
+  if (!order) throw notFound("ไม่พบใบสั่งผลิตที่ระบุ");
+  const current = order.production_status as ProductionStatus;
+  if (!NEXT_STATUS[current].includes(next)) {
+    throw conflict(`เปลี่ยนสถานะจาก "${current}" เป็น "${next}" ไม่ได้`);
+  }
+  return order;
+}
+
+export async function startProduction(id: string) {
+  await dbConnect();
+  assertObjectId(id);
+  const order = await transition(id, "in_progress");
+  order.production_status = "in_progress";
+  if (!order.started_at) order.started_at = new Date();
+  await order.save();
+  return getProductionOrderById(id);
+}
+
+/**
+ * ปิดงานผลิต: in_progress → done
+ * รายการที่ยังไม่ถูกหักสต็อก (stock_updated_at = null) และไม่ถูกยกเลิก จะถูกหักสต็อกให้ตอนนี้
+ */
+export async function completeProduction(
+  id: string,
+  opts: { performed_by: string; use_actual?: boolean; allowNegative?: boolean }
+) {
+  await dbConnect();
+  assertObjectId(id);
+  if (!opts.performed_by) throw badRequest("ต้องระบุ performed_by");
+
+  const order = await transition(id, "done");
+
+  const pendingItems = await productionItemModel
+    .find({
+      production_order_id: order._id,
+      deleted_at: null,
+      stock_updated_at: null,
+      item_status: { $ne: "cancelled" },
+    })
+    .lean<any[]>();
+
+  for (const it of pendingItems) {
+    await productionItemService.consumeStock(String(it._id), {
+      performed_by: opts.performed_by,
+      use_actual: opts.use_actual,
+      allowNegative: opts.allowNegative,
+    });
+  }
+
+  order.production_status = "done";
+  order.completed_at = new Date();
+  await order.save();
+
+  // docs/BACKLOG4.md Y2 — เดิมผลิตเสร็จแล้วหักแค่วัตถุดิบ ไม่เพิ่มสต็อกสินค้า ต้องไปปรับสต็อกเองทุกครั้ง
+  await addFinishedGoodsStock(String(order._id), { use_actual: opts.use_actual });
+  return getProductionOrderById(id);
+}
+
+/**
+ * ปิดงานผลิตแล้ว → เพิ่มสต็อกสินค้าสำเร็จรูป (docs/BACKLOG4.md Y2 — ตัดสินใจ 2026-10-01: เพิ่มอัตโนมัติ)
+ *   - เฉพาะสินค้าปกติ (is_preorder: false) — พรีออเดอร์ไม่มีสต็อก ของส่งตรงให้ลูกค้าที่สั่ง
+ *   - จำนวน = actual_qty ถ้าส่ง use_actual และกรอกไว้ ไม่งั้น planned_qty (เดียวกับที่ใช้หักวัตถุดิบ)
+ *   - ข้ามรายการที่ยกเลิก / จำนวน 0 · ครั้งเดียวต่อรายการ (จอง product_stock_added_at แบบ atomic)
+ *   - เพิ่มผ่าน productService.increaseStock (atomic $inc เดียวกับการรับสินค้าเข้าสต็อก)
+ *   - สินค้าที่มีตัวเลือกก็เพิ่มที่ตัวสินค้า — ตัวเลือกเป็นแค่ราคาเพิ่ม ไม่มีสต็อกแยก (docs/customer-backend-merge.md §8)
+ */
+async function addFinishedGoodsStock(orderId: string, opts: { use_actual?: boolean } = {}): Promise<void> {
+  const items = await productionItemModel
+    .find({
+      production_order_id: orderId,
+      deleted_at: null,
+      item_status: { $ne: "cancelled" },
+      product_stock_added_at: null,
+    })
+    .lean<any[]>();
+  if (items.length === 0) return;
+
+  const products = await productModel
+    .find({ _id: { $in: items.map((i) => i.product_id) } })
+    .select("is_preorder")
+    .lean<Array<{ _id: unknown; is_preorder?: boolean }>>();
+  const preorderIds = new Set(products.filter((p) => isPreorderProduct(p)).map((p) => String(p._id)));
+
+  for (const it of items) {
+    if (preorderIds.has(String(it.product_id))) continue;
+    const qty = opts.use_actual && it.actual_qty != null ? Number(it.actual_qty) : Number(it.planned_qty);
+    if (!(qty > 0)) continue;
+
+    const claimed = await productionItemModel.findOneAndUpdate(
+      { _id: it._id, product_stock_added_at: null },
+      { $set: { product_stock_added_at: new Date(), product_stock_added_qty: qty } }
+    );
+    if (!claimed) continue;
+    await productService.increaseStock(String(it.product_id), qty);
+  }
+}
+
+/**
+ * ยกเลิกงานผลิต → cancelled
+ * รายการที่หักสต็อกไปแล้วจะถูกคืนสต็อก (สร้างรายการ receive ชดเชย)
+ */
+export async function cancelProduction(
+  id: string,
+  opts: { performed_by?: string; reason?: string } = {}
+) {
+  await dbConnect();
+  assertObjectId(id);
+
+  const order = await transition(id, "cancelled");
+
+  const consumedItems = await productionItemModel
+    .find({
+      production_order_id: order._id,
+      deleted_at: null,
+      stock_updated_at: { $ne: null },
+    })
+    .lean<any[]>();
+
+  if (consumedItems.length && !opts.performed_by) {
+    throw badRequest("มีรายการที่หักสต็อกไปแล้ว ต้องระบุ performed_by เพื่อคืนสต็อก");
+  }
+  for (const it of consumedItems) {
+    await productionItemService.reverseStock(String(it._id), {
+      performed_by: opts.performed_by as string,
+    });
+  }
+
+  await productionItemModel.updateMany(
+    { production_order_id: order._id, deleted_at: null, item_status: { $ne: "cancelled" } },
+    { $set: { item_status: "cancelled" } }
+  );
+
+  order.production_status = "cancelled";
+  if (opts.reason) order.production_note = `${order.production_note ?? ""} [ยกเลิก: ${opts.reason}]`.trim();
+  await order.save();
+  return getProductionOrderById(id);
+}
+
+// ── DELETE (soft) ─────────────────────────────────────────
+export async function deleteProductionOrder(id: string) {
+  await dbConnect();
+  assertObjectId(id);
+  const order = await productionOrderModel.findOne({ _id: id, deleted_at: null });
+  if (!order) throw notFound("ไม่พบใบสั่งผลิตที่ระบุ หรือถูกลบไปแล้ว");
+  if (!["done", "cancelled"].includes(order.production_status)) {
+    throw conflict("ลบได้เฉพาะใบสั่งผลิตที่เสร็จหรือยกเลิกแล้ว");
+  }
+  order.deleted_at = new Date();
+  await order.save();
+  await productionItemModel.updateMany(
+    { production_order_id: order._id, deleted_at: null },
+    { $set: { deleted_at: new Date() } }
+  );
+  return { deleted: true, _id: order._id };
+}

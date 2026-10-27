@@ -1,0 +1,142 @@
+"use client";
+// View ของ Store Design — กริดแบนเนอร์หน้าร้าน + modal เพิ่ม/แก้ไข
+// ลากการ์ดจัดลำดับ (HTML5 drag-and-drop เนทีฟ ไม่พึ่งไลบรารีเพิ่ม — แพทเทิร์นเดียวกับ StatusBoard
+// ของหน้า Production) state การลาก (draggingId/dragOverId) อยู่ในนี้ ธุรกิจ (ยิง PATCH อะไร) อยู่ที่
+// useStoreDesignViewModel.onReorder แล้ว
+import dynamic from "next/dynamic";
+import { useOpenedOnce } from "@/hooks/useOpenedOnce";
+import { useState } from "react";
+import { useTranslations } from "next-intl";
+import { Button } from "@/components/base";
+import { ListPageLayout } from "@/components/shared/layout";
+import { LoadFailed, LoadingSpin } from "@/components/shared/feedback";
+import { StatCard, StatCardsGrid } from "@/components/shared/stats";
+import { FilterToolbar, SearchInput, TypeTabBar } from "@/components/shared/data";
+import { actionIcon } from "@/components/shared/actions";
+import type { useStoreDesignViewModel } from "./useStoreDesignViewModel";
+import { BannerCard } from "./_components/BannerCard";
+import { RestoreDeletedButton } from "@/components/shared/restore";
+
+// ฟอร์มแบนเนอร์ (Form/DatePicker/อัปโหลดรูป) แยก chunk — โหลดเมื่อเปิดครั้งแรก (โมดัลไม่ render ฝั่ง server อยู่แล้ว)
+const BannerFormModal = dynamic(() => import("./_components/BannerFormModal").then((m) => m.BannerFormModal), { ssr: false });
+
+type VM = ReturnType<typeof useStoreDesignViewModel>;
+
+export function StoreDesignView(vm: VM) {
+  const t = useTranslations();
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [dragOverId, setDragOverId] = useState<string | null>(null);
+  const formUsed = useOpenedOnce(vm.modalOpen);
+
+  const handleDrop = (targetId: string) => {
+    const id = draggingId;
+    setDraggingId(null);
+    setDragOverId(null);
+    if (id) vm.onReorder(id, targetId);
+  };
+
+  return (
+    <ListPageLayout
+      title={t("storeDesign.title")}
+      actions={
+        <>
+          <RestoreDeletedButton menu="store_design" resources={["banners"]} />
+          {vm.perm.create && (
+            <Button type="primary" icon={actionIcon("add")} onClick={vm.openAdd}>
+              {t("storeDesign.addBanner")}
+            </Button>
+          )}
+        </>
+      }
+      toolbar={
+        <FilterToolbar
+          left={
+            <>
+              <TypeTabBar
+                value={vm.tab}
+                onChange={vm.setTab}
+                options={[
+                  { value: "all", label: `${t("common.all")} (${vm.counts.all})` },
+                  { value: "active", label: `${t("enums.bannerStatus.active")} (${vm.counts.active})` },
+                  { value: "scheduled", label: `${t("enums.bannerStatus.scheduled")} (${vm.counts.scheduled})` },
+                  { value: "inactive", label: `${t("enums.bannerStatus.inactive")} (${vm.counts.inactive})` },
+                  { value: "expired", label: `${t("enums.bannerStatus.expired")} (${vm.counts.expired})` },
+                ]}
+              />
+              <SearchInput value={vm.search} onChange={vm.setSearch} placeholder={t("storeDesign.searchPlaceholder")} />
+            </>
+          }
+        />
+      }
+    >
+      {vm.isError ? (
+        <LoadFailed onRetry={vm.refetch} />
+      ) : vm.isLoading ? (
+        <LoadingSpin />
+      ) : (
+        <div className="flex flex-col gap-5">
+          <StatCardsGrid cols={5}>
+            <StatCard label={t("storeDesign.statTotal")} value={vm.counts.all} sub={t("storeDesign.statTotalSub")} />
+            <StatCard label={t("enums.bannerStatus.active")} value={vm.counts.active} sub={t("storeDesign.statActiveSub")} tone="up" />
+            <StatCard label={t("enums.bannerStatus.scheduled")} value={vm.counts.scheduled} sub={t("storeDesign.statScheduledSub")} tone="warn" />
+            <StatCard label={t("enums.bannerStatus.inactive")} value={vm.counts.inactive} sub={t("storeDesign.statInactiveSub")} tone="muted" />
+            <StatCard label={t("enums.bannerStatus.expired")} value={vm.counts.expired} sub={t("storeDesign.statExpiredSub")} tone="down" />
+          </StatCardsGrid>
+
+          {/* ไม่มีสิทธิ์ products.update = ลากเรียงไม่ได้อยู่แล้ว — ซ่อนคำใบ้ทิ้งไปเลย ไม่ต้องบอกวิธีทำสิ่งที่ทำไม่ได้ */}
+          {vm.perm.update && (
+            <p className="text-sm text-gray-500">
+              {t(vm.canReorder ? "storeDesign.reorderHint" : "storeDesign.reorderDisabledHint")}
+            </p>
+          )}
+
+          {/* ไม่ใส่ items-start → การ์ดยืดเต็มแถว (BannerCard h-full) สูงเท่ากัน รวมถึงปุ่ม "เพิ่มแบนเนอร์" */}
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+            {vm.rows.map((b, i) => (
+              <BannerCard
+                key={b._id}
+                banner={b}
+                priority={i < 2}
+                draggable={vm.canReorder && vm.perm.update}
+                dragging={draggingId === b._id}
+                dragOver={dragOverId === b._id}
+                onEdit={vm.openEdit}
+                onDelete={vm.onDelete}
+                onToggle={vm.onToggle}
+                canUpdate={vm.perm.update}
+                canDelete={vm.perm.delete}
+                onDragStart={setDraggingId}
+                onDragOver={() => setDragOverId(b._id)}
+                onDragLeave={() => setDragOverId((prev) => (prev === b._id ? null : prev))}
+                onDrop={handleDrop}
+                onDragEnd={() => { setDraggingId(null); setDragOverId(null); }}
+              />
+            ))}
+            {vm.perm.create && (
+              <button
+                type="button"
+                onClick={vm.openAdd}
+                className="flex min-h-[200px] flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-gray-200 text-gray-500 transition-colors hover:border-gray-400 hover:bg-gray-50 hover:text-gray-600"
+              >
+                {actionIcon("add", undefined, "h-7 w-7")}
+                <span className="text-sm font-medium">{t("storeDesign.addBanner")}</span>
+                <span className="px-4 text-center text-xs leading-relaxed">{t("storeDesign.addCardHint")}</span>
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {formUsed && (
+        <BannerFormModal
+          key={vm.editTarget?._id ?? "new"}
+          open={vm.modalOpen}
+          editTarget={vm.editTarget}
+          saving={vm.saving}
+          onClose={vm.closeModal}
+          onSubmit={vm.onSubmit}
+        />
+      )}
+    </ListPageLayout>
+  );
+}

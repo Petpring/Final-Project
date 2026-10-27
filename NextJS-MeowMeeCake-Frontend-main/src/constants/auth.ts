@@ -1,0 +1,39 @@
+// ─────────────────────────────────────────────────────────────
+// src/constants/auth.ts
+// ค่าคงที่ auth ฝั่ง frontend — ดู docs/AUTH_PLAN.md §FRONTEND PIVOT
+// ─────────────────────────────────────────────────────────────
+
+/** ชื่อ cookie ที่ backend ตั้งตอน login — frontend เช็คแค่ "มีไหม" ไม่ verify (D18) */
+/** react-query key ของผู้ใช้ปัจจุบัน (useCurrentUser) — อยู่ที่นี่เพื่อให้ server component (owner layout) ใช้ค่าเดียวกันได้ */
+export const CURRENT_USER_KEY = ["auth", "me"] as const;
+/** react-query key ของผู้ใช้หน้าร้าน (useCustomerSession) — customer/layout.tsx (server) ใส่ค่าให้ล่วงหน้า */
+export const CUSTOMER_SESSION_KEY = ["auth", "me", "optional"] as const;
+
+export const AUTH_COOKIE = process.env.NEXT_PUBLIC_AUTH_COOKIE || "mmc_session";
+
+/**
+ * ใครเป็นด่านหน้ากั้น /owner/* ก่อน render (D18):
+ *  - "cookie" (ดีฟอลต์): proxy.ts เช็คว่ามี auth cookie ไหม — ใช้ได้เมื่อ cookie ของ backend มองเห็นได้จาก origin ของ
+ *    frontend คือ dev บน localhost หรือ backend/frontend เป็น subdomain ของ site เดียวกันแล้ว backend ตั้ง COOKIE_DOMAIN
+ *  - "client": proxy ไม่เช็ค cookie เลย — ใช้เมื่อ frontend กับ backend อยู่คนละ site (cookie ติดอยู่กับโดเมน backend
+ *    frontend มองไม่เห็นตลอดกาล ถ้ายังเช็คจะ login สำเร็จแล้วถูกเด้งกลับ /login วนไม่จบ) ด่านหน้าเหลือแค่ฝั่ง client
+ *    (OwnerLayout เรียก /auth/me → 401 = เด้งไป login) ส่วนของจริงคือ backend กั้นทุก route อยู่แล้ว
+ */
+export const AUTH_GATE: "cookie" | "client" = process.env.NEXT_PUBLIC_AUTH_GATE === "client" ? "client" : "cookie";
+
+export const LOGIN_PATH = "/login";
+export const HOME_PATH = "/owner/dashboard";
+export const ACCESS_DENIED_PATH = "/owner/access-denied";
+/** บัญชีของฉัน (เจ้าของร้าน/พนักงาน) — ข้อมูลตัวเอง · เปลี่ยนรหัสผ่าน · ประวัติการทำงานของตัวเอง · login พอ ไม่ผูกเมนูสิทธิ์ */
+export const OWNER_ACCOUNT_PATH = "/owner/account";
+/** หน้าแรกของหน้าร้าน (ลูกค้า + guest) — ย้ายมาจาก FrontOffice (เลิกใช้ backend port 4000) */
+export const CUSTOMER_HOME_PATH = "/customer";
+
+/** หน้าโปรไฟล์ (เชื่อม LINE) — ต้องตรงกับ LINE_LINK_RETURN_URL ของ backend */
+export const PROFILE_PATH = "/profile";
+
+/** ความยาวรหัสผ่านขั้นต่ำ — ต้องตรงกับ MIN_PASSWORD_LENGTH ของ backend (src/services/userService.ts) */
+export const MIN_PASSWORD_LENGTH = 8;
+
+/** ช่องทาง sync การ logout ข้ามแท็บ */
+export const AUTH_BROADCAST_CHANNEL = "mmc-auth";

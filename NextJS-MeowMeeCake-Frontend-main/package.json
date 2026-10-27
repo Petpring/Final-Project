@@ -1,0 +1,50 @@
+{
+  "name": "meowmeecake-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "sideEffects": [
+    "**/*.css"
+  ],
+  "scripts": {
+    "dev": "next dev -p 3001",
+    "build": "next build",
+    "start": "next start -p 3001",
+    "lint": "eslint",
+    "lint:i18n": "node scripts/check-i18n.mjs --strict",
+    "lint:theme": "node scripts/check-theme.mjs --strict",
+    "lint:ui": "node scripts/check-ui.mjs --strict",
+    "lint:ui:update": "node scripts/check-ui.mjs --update",
+    "check": "node scripts/check-i18n.mjs --strict && node scripts/check-theme.mjs --strict && node scripts/check-ui.mjs --strict && tsc --noEmit && eslint"
+  },
+  "dependencies": {
+    "@ant-design/cssinjs": "^2.1.2",
+    "@heroicons/react": "^2.2.0",
+    "@tanstack/react-query": "^5.62.0",
+    "antd": "^6.4.3",
+    "axios": "^1.7.9",
+    "dayjs": "^1.11.13",
+    "lucide-react": "^1.17.0",
+    "next": "16.3.8",
+    "next-intl": "^4.14.1",
+    "qrcode": "^1.5.4",
+    "react": "^18.3.1",
+    "react-compiler-runtime": "1.0.0",
+    "react-dom": "^18.3.1",
+    "react-icons": "^5.7.0",
+    "recharts": "^3.8.1",
+    "sweetalert2": "^11.26.25",
+    "zustand": "^5.0.15"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^18.3.30",
+    "@types/react-dom": "^18.3.7",
+    "babel-plugin-react-compiler": "1.0.0",
+    "eslint": "^9",
+    "eslint-config-next": "16.3.8",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}

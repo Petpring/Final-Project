@@ -1,0 +1,28 @@
+/**
+ * PUT /api/admin/users/[id]/password — แอดมินตั้งรหัสผ่านใหม่ให้ (employees.update)
+ *   body: { new_password }  — ไม่ต้องยืนยันรหัสเดิม + ปลดล็อกบัญชี
+ *   (ผู้ใช้เปลี่ยนรหัสตัวเองที่ /api/shop/me/password)
+ *   ตั้งรหัสให้บัญชีในบทบาท owner ได้เฉพาะ owner — กันพนักงานตั้งรหัสแล้วล็อกอินเป็นเจ้าของร้าน (ownerProtection)
+ */
+import { ok } from "@/lib/apiResponse";
+import { withPermission } from "@/lib/authGuard";
+import { auditChange } from "@/lib/audit";
+import { badRequest } from "@/lib/httpError";
+import * as userService from "@/services/userService";
+import { assertMayManageUser } from "@/services/ownerProtection";
+import { assertMayManageUserWithin } from "@/services/permissionCeiling";
+
+type Ctx = { params: Promise<{ id: string }> };
+
+export const PUT = withPermission("employees", "update", async (session, req, ctx: Ctx) => {
+  const { id } = await ctx.params;
+  await assertMayManageUser(session, id);
+  await assertMayManageUserWithin(session, id);
+  const body = await req.json();
+  const next = body.new_password ?? body.newPassword;
+  if (!next) throw badRequest("ต้องระบุ new_password");
+  const result = await userService.adminSetPassword(id, next);
+  // ไม่มีค่าก่อน/หลัง (รหัสผ่านไม่บันทึกเด็ดขาด) — แค่ระบุว่าตั้งให้ใคร
+  auditChange(req, { op: "update", verb: "ตั้งรหัสผ่านใหม่ให้", noun: "ผู้ใช้", entity: "User", entity_id: id, after: await userService.getUserById(id, { includeDeleted: true }).catch(() => undefined), keys: [] });
+  return ok(result);
+});

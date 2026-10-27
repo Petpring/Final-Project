@@ -1,0 +1,282 @@
+/**
+ * crudRoutes — โรงงานสร้าง route handler (controller) มาตรฐานจาก CrudService
+ *
+ *   // src/app/api/units/route.ts
+ *   export const { GET, POST } = collectionRoutes(unitService, {
+ *     sortable: ["created_at", "unit_name"],
+ *     defaultSort: "unit_name",
+ *     auth: { menu: "products", publicRead: true },   // GET เปิด, POST ต้องมีสิทธิ์ products.create
+ *     audit: { entity: "Unit" },                      // บันทึก UserLog เมื่อ create/update/delete/restore
+ *   });
+ *
+ *   // src/app/api/units/[id]/route.ts
+ *   export const { GET, PATCH, DELETE } = itemRoutes(unitService, { auth: {...}, audit: { entity: "Unit" } });
+ *
+ * auth (ไม่ใส่ = เปิดหมด — ใช้กับ endpoint ภายในเท่านั้น):
+ *   - publicRead: true  → GET ไม่ต้องล็อกอิน ; POST/PATCH/DELETE ต้องมีสิทธิ์ create/update/delete ของ menu
+ *   - publicRead: false → GET ต้องมีสิทธิ์ view ด้วย
+ *   - readMenus: [...]  → GET ผ่านได้ถ้ามี view ของ menu หรือเมนูใดเมนูหนึ่งในนี้ (ข้อมูลอ้างอิงที่หลายหน้าใช้ เช่นหน่วยนับ)
+ *                         POST/PATCH/DELETE ยังต้องมีสิทธิ์ของ menu หลักเหมือนเดิม
+ *
+ * validate (ไม่ใส่ = รับ body ดิบเหมือนเดิม, service ตรวจเอง):
+ *   - validate.create → parse body ของ POST ด้วย zod schema (บาด JSON / schema ผิด → 400 + issues)
+ *   - validate.update → parse body ของ PATCH (ปกติเป็น createSchema.partial())
+ *
+ * createInject/updateInject: ฟิลด์ที่ derive จาก session แล้วยัดเข้า body ก่อนส่งเข้า service (กัน
+ * client ตั้งเองผ่าน request body ตรง ๆ) — `createInject` ใช้กับ POST (`collectionRoutes`),
+ * `updateInject` ใช้กับ PATCH (`itemRoutes`, BACKLOG §3.17) ทั้งคู่ต้องตั้ง `auth` ด้วยเพื่อให้มี session
+ *
+ * authorize: กติกาเพิ่มเติมนอกสิทธิ์เมนู ที่ต้องดู session + ข้อมูลเป้าหมาย (เช่น เฉพาะ owner แตะบทบาท owner ได้ —
+ * services/ownerProtection.ts) · เรียกหลังผ่าน `auth` และ validate body แล้ว ก่อนเขียนจริง · throw เพื่อปฏิเสธ
+ * ใช้ได้กับ POST (collectionRoutes) · PATCH/DELETE (itemRoutes) · restore (restoreRoute) · ต้องตั้ง `auth` ด้วย
+ */
+import type { NextRequest } from "next/server";
+import type { z } from "zod";
+import { ok, okList, created, route } from "./apiResponse";
+import { parseBool, parsePagination, parseSort } from "./queryParams";
+import { parseBody } from "./validate";
+import { authenticate, requireAuth, requirePermission, type PermAction } from "./authGuard";
+import type { SessionUser } from "./session";
+import { auditChange } from "./audit";
+import type { MenuKey } from "./menuKeys";
+import type { MenuSpec } from "./authGuard";
+import type { CrudService } from "./crudService";
+
+type RouteContext = { params: Promise<{ id: string }> };
+
+export interface CrudAuth {
+  menu: MenuSpec;
+  /** GET (list/get) เปิดสาธารณะ ไม่ต้องล็อกอิน */
+  publicRead?: boolean;
+  /** GET ผ่านได้ด้วย view ของเมนูเหล่านี้ด้วย (นอกจาก menu) — เขียนยังต้องใช้ menu (ดูหัวไฟล์) */
+  readMenus?: MenuKey[];
+}
+
+/** zod schema สำหรับ body ของ crud factory (ไม่ใส่ = รับ body ดิบ) */
+export interface CrudValidate {
+  create?: z.ZodType;
+  update?: z.ZodType;
+}
+
+/** อ่าน body: มี schema → parseBody (throw 400 ถ้าไม่ผ่าน) · ไม่มี → req.json() แบบ tolerant เดิม
+ *  (คืน Record<string, unknown> — ตรงกับ Doc ของ CrudService.create/update) */
+async function readBody(
+  req: NextRequest,
+  schema: z.ZodType | undefined
+): Promise<Record<string, unknown>> {
+  // z.infer<z.ZodType> (base class, ไม่ใช่ schema เฉพาะ) resolve เป็น unknown — cast ให้ตรง signature
+  if (schema) return (await parseBody(req, schema)) as Record<string, unknown>;
+  return req.json().catch(() => ({})) as Promise<Record<string, unknown>>;
+}
+
+/** บันทึก audit log สำหรับ mutation ของ crud factory (ถ้าตั้ง opts.audit) */
+export interface CrudAudit {
+  /** ชื่อ entity ที่จะบันทึกลง UserLog เช่น "Ingredient", "Recipe" */
+  entity: string;
+}
+
+/** ตรวจสิทธิ์ตาม config — คืน session ที่ตรวจกับ DB แล้ว · ไม่ได้ตั้ง auth (หรืออ่านสาธารณะ) = null */
+async function guard(
+  req: NextRequest,
+  auth: CrudAuth | undefined,
+  action: PermAction
+): Promise<SessionUser | null> {
+  if (!auth) return null;
+  if (action === "view" && auth.publicRead) return null;
+  const session = await authenticate(req);
+  if (action === "view" && auth.readMenus?.length) {
+    for (const menu of [auth.menu, ...auth.readMenus]) {
+      try {
+        await requirePermission(session, menu, "view");
+        return session;
+      } catch {
+        // ลองเมนูถัดไป — ไม่ผ่านสักเมนูค่อยตอบ 403 ของเมนูหลักด้านล่าง
+      }
+    }
+  }
+  await requirePermission(session, auth.menu, action);
+  return session;
+}
+
+/** กติกาเพิ่มเติมหลังผ่านสิทธิ์เมนู (ดูหัวไฟล์) */
+export type CrudAuthorize = (
+  session: SessionUser,
+  args: { op: "create" | "update" | "delete" | "restore"; id?: string; body?: Record<string, unknown> }
+) => Promise<void> | void;
+
+async function runAuthorize(
+  authorize: CrudAuthorize | undefined,
+  session: SessionUser | null,
+  args: Parameters<CrudAuthorize>[1]
+): Promise<void> {
+  if (!authorize) return;
+  // ตั้ง authorize แต่ไม่ได้ตั้ง auth = ไม่มี session ให้ตรวจ → ปฏิเสธไว้ก่อน (fail closed)
+  if (!session) throw new Error("crudRoutes: authorize ต้องใช้คู่กับ auth");
+  await authorize(session, args);
+}
+
+/** ชื่อชนิดข้อมูลภาษาไทยในข้อความ log (เดิมเป็น "แก้ไขIngredient") — ไม่อยู่ในนี้ใช้ชื่อ entity ตรง ๆ */
+const ENTITY_NOUN: Record<string, string> = {
+  Aspect: "หัวข้อรีวิว",
+  Banner: "แบนเนอร์",
+  Component: "ส่วนประกอบ",
+  ComponentCategory: "หมวดหมู่ส่วนประกอบ",
+  DeliveryZone: "โซนค่าจัดส่ง",
+  Expense: "ค่าใช้จ่าย",
+  Ingredient: "วัตถุดิบ",
+  IngredientCategory: "หมวดหมู่วัตถุดิบ",
+  ProductCategory: "หมวดหมู่สินค้า",
+  ProductOption: "ตัวเลือกสินค้า",
+  ProductVariant: "รูปแบบสินค้า",
+  Recipe: "สูตร",
+  Role: "บทบาท",
+  SemanticTerm: "คำค้นเชิงความหมาย",
+  Unit: "หน่วยนับ",
+};
+
+/**
+ * log ของ crud factory — ชื่อรายการ + ก่อน/หลัง (auditChange)
+ * update: before = doc ก่อนแก้ (อ่านก่อนเขียน) · keys = ฟิลด์ใน body เท่านั้น (ไม่ปนฟิลด์ที่ระบบคำนวณเอง)
+ */
+function logMutation(
+  req: NextRequest,
+  cfg: CrudAudit | undefined,
+  op: "create" | "update" | "delete" | "restore",
+  doc: { _id?: unknown } | null | undefined,
+  extra: { before?: unknown; keys?: string[] } = {}
+): void {
+  if (!cfg) return;
+  auditChange(req, {
+    op,
+    noun: ENTITY_NOUN[cfg.entity] ?? cfg.entity,
+    entity: cfg.entity,
+    entity_id: doc?._id ? String(doc._id) : null,
+    before: op === "delete" ? doc : extra.before,
+    after: op === "delete" ? undefined : doc,
+    keys: extra.keys,
+  });
+}
+
+/** doc ก่อนแก้สำหรับ log — อ่านไม่ได้ปล่อยว่าง (update จะโยน 404 เองตามปกติ) */
+async function beforeForAudit(
+  service: Pick<CrudService, "getById">,
+  cfg: CrudAudit | undefined,
+  id: string
+): Promise<unknown> {
+  if (!cfg) return undefined;
+  return service.getById(id, true).catch(() => undefined);
+}
+
+export interface CollectionRoutesOptions {
+  sortable: string[];
+  defaultSort: string;
+  defaultSortOrder?: "asc" | "desc";
+  filterFromQuery?: (sp: URLSearchParams) => Record<string, unknown>;
+  defaultLimit?: number;
+  auth?: CrudAuth;
+  audit?: CrudAudit;
+  validate?: CrudValidate;
+  /** ฟิลด์ที่ inject จาก session ตอน POST (เช่น { created_by: s.user_id }) — merge ทับ body
+   *  กัน client ตั้งค่าเอง (mass-assign) · ต้องตั้ง `auth` ด้วยเพื่อให้มี session */
+  createInject?: (session: SessionUser) => Record<string, unknown>;
+  /** กติกาเพิ่มเติมก่อนสร้าง (ดูหัวไฟล์) */
+  authorize?: CrudAuthorize;
+}
+
+export function collectionRoutes(
+  service: Pick<CrudService, "list" | "create">,
+  opts: CollectionRoutesOptions
+) {
+  const GET = route(async (req: NextRequest) => {
+    await guard(req, opts.auth, "view");
+    const sp = req.nextUrl.searchParams;
+    const rawFilter = opts.filterFromQuery?.(sp) ?? {};
+    const filter = Object.fromEntries(
+      Object.entries(rawFilter).filter(([, v]) => v !== undefined)
+    );
+
+    const result = await service.list({
+      pagination: parsePagination(sp, opts.defaultLimit),
+      search: sp.get("search") ?? undefined,
+      sort: parseSort(sp, opts.sortable, opts.defaultSort, opts.defaultSortOrder),
+      includeDeleted: parseBool(sp.get("includeDeleted")) ?? false,
+      filter,
+    });
+    return okList(result.items, result.meta);
+  });
+
+  const POST = route(async (req: NextRequest) => {
+    const session = await guard(req, opts.auth, "create");
+    const body = await readBody(req, opts.validate?.create);
+    await runAuthorize(opts.authorize, session, { op: "create", body });
+    const injected = opts.createInject ? opts.createInject(requireAuth(req)) : undefined;
+    const doc = await service.create(injected ? { ...body, ...injected } : body);
+    logMutation(req, opts.audit, "create", doc, { keys: Object.keys(body) });
+    return created(doc);
+  });
+
+  return { GET, POST };
+}
+
+export interface ItemRoutesOptions {
+  auth?: CrudAuth;
+  audit?: CrudAudit;
+  validate?: CrudValidate;
+  /** ฟิลด์ที่ inject จาก session ตอน PATCH (เช่น { updated_by: s.user_id }) — merge ทับ body
+   *  กัน client ตั้งค่าเอง (mass-assign) · คู่กับ `createInject` ของ `CollectionRoutesOptions`
+   *  (BACKLOG §3.17 — เดิมไม่มีจุดเทียบเท่านี้ฝั่ง PATCH เลย) · ต้องตั้ง `auth` ด้วยเพื่อให้มี session */
+  updateInject?: (session: SessionUser) => Record<string, unknown>;
+  /** กติกาเพิ่มเติมก่อนแก้ / ลบ / กู้คืน (ดูหัวไฟล์) */
+  authorize?: CrudAuthorize;
+}
+
+export function itemRoutes(
+  service: Pick<CrudService, "getById" | "update" | "remove">,
+  opts: ItemRoutesOptions = {}
+) {
+  const GET = route(async (req: NextRequest, ctx: RouteContext) => {
+    await guard(req, opts.auth, "view");
+    const { id } = await ctx.params;
+    const includeDeleted = parseBool(req.nextUrl.searchParams.get("includeDeleted")) ?? false;
+    return ok(await service.getById(id, includeDeleted));
+  });
+
+  const PATCH = route(async (req: NextRequest, ctx: RouteContext) => {
+    const session = await guard(req, opts.auth, "update");
+    const { id } = await ctx.params;
+    const body = await readBody(req, opts.validate?.update);
+    await runAuthorize(opts.authorize, session, { op: "update", id, body });
+    const injected = opts.updateInject ? opts.updateInject(requireAuth(req)) : undefined;
+    const before = await beforeForAudit(service, opts.audit, id);
+    const doc = await service.update(id, injected ? { ...body, ...injected } : body);
+    logMutation(req, opts.audit, "update", doc ?? { _id: id }, { before, keys: Object.keys(body) });
+    return ok(doc);
+  });
+
+  const DELETE = route(async (req: NextRequest, ctx: RouteContext) => {
+    const session = await guard(req, opts.auth, "delete");
+    const { id } = await ctx.params;
+    await runAuthorize(opts.authorize, session, { op: "delete", id });
+    const doc = await service.remove(id);
+    logMutation(req, opts.audit, "delete", doc ?? { _id: id });
+    return ok(doc);
+  });
+
+  return { GET, PATCH, DELETE };
+}
+
+/** route สำหรับ POST /api/xxx/[id]/restore */
+export function restoreRoute(
+  service: Pick<CrudService, "restore">,
+  opts: ItemRoutesOptions = {}
+) {
+  const POST = route(async (req: NextRequest, ctx: RouteContext) => {
+    const session = await guard(req, opts.auth, "update");
+    const { id } = await ctx.params;
+    await runAuthorize(opts.authorize, session, { op: "restore", id });
+    const doc = await service.restore(id);
+    logMutation(req, opts.audit, "restore", doc ?? { _id: id });
+    return ok(doc);
+  });
+  return { POST };
+}

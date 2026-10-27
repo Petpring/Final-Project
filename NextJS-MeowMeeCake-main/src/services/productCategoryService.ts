@@ -1,0 +1,15 @@
+/**
+ * productCategoryService — CRUD หมวดหมู่สินค้า (ProductCategories)
+ * เอนทิตีเรียบง่าย ใช้ crudService factory ตรง ๆ
+ */
+import productCategoryModel from "../models/productCategoryModel";
+import { createCrudService } from "../lib/crudService";
+
+export const productCategoryService = createCrudService(productCategoryModel, {
+  label: "หมวดหมู่สินค้า",
+  searchFields: ["product_category_name"],
+  // ships_nationwide — ส่งทั่วประเทศได้ไหม (ออเดอร์เว็บ · src/lib/shipping.ts)
+  createFields: ["product_category_name", "ships_nationwide"],
+});
+
+export default productCategoryService;

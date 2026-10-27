@@ -1,0 +1,142 @@
+/**
+ * middleware — ชั้นตรวจตัวตน (authentication) + กั้น namespace หยาบ ๆ รันบน Edge ก่อนถึง route handler
+ *
+ * โครง path:
+ *   /api/auth/*     , /api/health , /api/catalog/*  → สาธารณะ (ไม่ต้องล็อกอิน)
+ *   /api/cron/*                                     → ไม่ใช้ session — route ตรวจ CRON_SECRET เอง
+ *   /api/shop/*                                     → ต้องล็อกอิน (ลูกค้า/พนักงานก็ได้)
+ *   /api/admin/*                                    → ต้องล็อกอิน + role_type ∈ {owner, staff}
+ *
+ * หน้าที่:
+ *  1. ลบ header x-mmc-user ที่ client อาจแนบปลอมมาทิ้งเสมอ
+ *  2. CORS: ตอบ preflight (OPTIONS) + แนบ Access-Control-Allow-* ให้ origin ใน ALLOWED_ORIGINS เท่านั้น
+ *     (src/lib/cors.ts — ไม่ตั้ง ALLOWED_ORIGINS = ปิดโหมดนี้ทั้งหมด เหมือนเดิม)
+ *  3. CSRF defense-in-depth: mutation (POST/PUT/PATCH/DELETE) ที่มี Origin ข้ามโดเมนนอก allowlist → 403
+ *     (เสริม cookie `SameSite=Lax`/`None` ที่กัน cross-site cookie อยู่แล้ว — src/lib/session.ts)
+ *  4. ตรวจลายเซ็น JWT ใน cookie → แนบข้อมูลผู้ใช้ลง header x-mmc-user
+ *     ไม่มี cookie `session` ของหลัก → ลอง session ของ next-auth (หน้าเว็บลูกค้า — customer-backend-merge.md §8.9)
+ *     แปลงเป็น SessionUser เดียวกัน (source: "nextauth") · สถานะบัญชีตรวจกับ DB ต่อใน authGuard
+ *  5. กั้น namespace ตามตารางข้างบน (role_type อยู่ใน JWT → เช็คได้บน Edge ไม่ต้อง query DB)
+ *
+ * การตรวจ "สิทธิ์ละเอียด" (Permissions ต้อง query DB) ทำใน route handler ของ /api/admin/* เท่านั้น
+ */
+import { NextRequest, NextResponse } from "next/server";
+import { getToken } from "next-auth/jwt";
+import { verifySession } from "@/lib/jwt";
+import { isCsrfSafe } from "@/lib/csrf";
+import { corsHeaders, isAllowedOrigin } from "@/lib/cors";
+import { SESSION_COOKIE, USER_HEADER, clearSession, type SessionUser } from "@/lib/session";
+
+// /api/cron/* ไม่ใช้ session — route ตรวจ CRON_SECRET เอง (src/lib/cronAuth.ts)
+const PUBLIC_PREFIXES = ["/api/auth/", "/api/health", "/api/catalog/", "/api/cron/"];
+
+/**
+ * path ใต้ namespace ที่ต้องล็อกอิน แต่ route ตรวจ session เองและตอบแบบของตัวเองตอนไม่มี session
+ * (ไม่ให้ middleware ตัดด้วย JSON 401) — ยังแนบ x-mmc-user ให้ตามปกติถ้า cookie ถูกต้อง
+ *   /api/shop/me/line/callback — เบราว์เซอร์ถูก LINE redirect มา ต้องพากลับหน้าโปรไฟล์เสมอ (docs/LINE.md §9.8)
+ */
+const SELF_AUTH_PATHS = new Set(["/api/shop/me/line/callback"]);
+
+function isPublic(pathname: string): boolean {
+  return (
+    SELF_AUTH_PATHS.has(pathname) || PUBLIC_PREFIXES.some((p) => pathname === p || pathname.startsWith(p))
+  );
+}
+
+function deny(code: string, message: string, status: number, clearCookie = false) {
+  const res = NextResponse.json(
+    { success: false, error: { code, message, details: null } },
+    { status }
+  );
+  // ใช้ clearSession (ไม่ใช่ res.cookies.delete) — ต้องส่ง Domain/Path เดียวกับตอนตั้ง ไม่งั้น cookie ที่มี COOKIE_DOMAIN ไม่ถูกลบ
+  return clearCookie ? clearSession(res) : res;
+}
+
+export async function middleware(req: NextRequest) {
+  const { pathname } = req.nextUrl;
+  const origin = req.headers.get("origin");
+  const cors = corsHeaders(origin); // {} ถ้า origin ไม่อยู่ใน allowlist
+
+  /** แนบ CORS header (ถ้ามี) ก่อนคืน response ทุกเส้นทาง */
+  const respond = (res: NextResponse): NextResponse => {
+    for (const [k, v] of Object.entries(cors)) res.headers.set(k, v);
+    return res;
+  };
+
+  // preflight — ตอบเองที่ Edge เพราะ route handler ไม่มี OPTIONS ให้
+  if (req.method === "OPTIONS") {
+    if (!isAllowedOrigin(origin)) return new NextResponse(null, { status: 204 });
+    return respond(
+      new NextResponse(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, Accept-Language",
+          "Access-Control-Max-Age": "600",
+        },
+      }),
+    );
+  }
+
+  // CSRF: mutation ต้องมาจาก origin เดียวกัน หรืออยู่ใน allowlist (ครอบทุก /api/* รวม /api/auth/*)
+  if (!isCsrfSafe(req.method, origin, req.nextUrl.host)) {
+    return respond(deny("CROSS_ORIGIN", "คำขอข้ามโดเมนถูกปฏิเสธ", 403));
+  }
+
+  const headers = new Headers(req.headers);
+  headers.delete(USER_HEADER); // กัน client ปลอม header
+
+  let user: SessionUser | null = null;
+  let clearStaleCookie = false;
+  const token = req.cookies.get(SESSION_COOKIE)?.value;
+  if (token) {
+    try {
+      user = await verifySession(token);
+      headers.set(USER_HEADER, JSON.stringify(user));
+    } catch {
+      if (!isPublic(pathname)) {
+        return respond(deny("SESSION_INVALID", "เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่", 401, true));
+      }
+      // cookie เสีย (หมดอายุ / เซ็นด้วย JWT_SECRET อื่น) แล้วถาม /api/auth/me → ลบทิ้งด้วย ไม่งั้น frontend เห็นว่า
+      // "มี cookie" แล้วพา /login → /owner/dashboard → /auth/me 401 → /login วนไม่จบ (เข้าหน้าล็อกอินไม่ได้)
+      // จำกัดแค่ GET /api/auth/me — route ล็อกอินตั้ง cookie ใหม่เอง ถ้าแนบคำสั่งลบไปด้วยอาจทับ cookie ใหม่
+      clearStaleCookie = req.method === "GET" && pathname === "/api/auth/me";
+    }
+  }
+
+  // next-auth (หน้าเว็บลูกค้า) — ใช้เมื่อไม่มี cookie ของหลัก · role "admin" ของฝั่งลูกค้าเดิม = owner
+  if (!user && !token && process.env.NEXTAUTH_SECRET) {
+    try {
+      const na = await getToken({ req, secret: process.env.NEXTAUTH_SECRET });
+      if (na?.id && na.role) {
+        user = {
+          user_id: String(na.id),
+          role_id: String(na.role_id ?? ""),
+          role_type: (na.role === "admin" ? "owner" : String(na.role)) as SessionUser["role_type"],
+          email: String(na.email ?? ""),
+          source: "nextauth",
+          auth_time: typeof na.auth_time === "number" ? na.auth_time : 0,
+        };
+        headers.set(USER_HEADER, JSON.stringify(user));
+      }
+    } catch {
+      // cookie ของ next-auth เสีย/หมดอายุ = ไม่มี session
+    }
+  }
+
+  if (pathname.startsWith("/api/admin/")) {
+    if (!user) return respond(deny("UNAUTHORIZED", "กรุณาเข้าสู่ระบบ", 401));
+    if (user.role_type !== "owner" && user.role_type !== "staff") {
+      return respond(deny("FORBIDDEN", "ส่วนนี้สำหรับพนักงานเท่านั้น", 403));
+    }
+  } else if (pathname.startsWith("/api/shop/") && !SELF_AUTH_PATHS.has(pathname)) {
+    if (!user) return respond(deny("UNAUTHORIZED", "กรุณาเข้าสู่ระบบ", 401));
+  }
+
+  const res = respond(NextResponse.next({ request: { headers } }));
+  return clearStaleCookie ? clearSession(res) : res;
+}
+
+export const config = {
+  matcher: ["/api/:path*"],
+};
